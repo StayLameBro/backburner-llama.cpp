@@ -1099,9 +1099,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "GDN_REPLAY_PREP",
+    "DFLASH_CONV",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1217,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "gdn_replay_prep(r,x,a,b)",
+    "dflash_conv(h,d,b)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6414,6 +6420,167 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        int64_t               n_replay,
+        int64_t               commit_at) {
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(n_replay >= 0 && n_replay < n_tokens);
+    GGML_ASSERT(commit_at >= 0 && commit_at <= n_tokens);
+
+    // build the plain op for the shape checks, then shrink the attention part of the output
+    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, 1);
+
+    result->ne[1] = (n_tokens - n_replay) * n_seqs + S_v * n_seqs;
+    for (int i = 2; i < GGML_MAX_DIMS; i++) {
+        result->nb[i] = result->nb[i - 1] * result->ne[i - 1];
+    }
+    GGML_ASSERT(ggml_nbytes(result) <= (size_t) S_v * H * (n_tokens * n_seqs + S_v * n_seqs) * sizeof(float));
+
+    ggml_set_op_params_i32(result, 1, (int32_t) n_replay);
+    ggml_set_op_params_i32(result, 2, (int32_t) commit_at);
+    ggml_set_op_params_i32(result, 3, 1); // replay mode
+
+    return result;
+}
+
+void ggml_gated_delta_net_set_l2(struct ggml_tensor * gdn, float eps) {
+    GGML_ASSERT(gdn->op == GGML_OP_GATED_DELTA_NET);
+    ggml_set_op_params_i32(gdn, 4, 1);
+    ggml_set_op_params_f32(gdn, 5, eps);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_replay_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * ids,
+        int64_t               n_replay,
+        int64_t               commit_at) {
+    const int64_t S_v    = v->ne[0];
+    const int64_t H      = v->ne[1];
+    const int64_t n_seqs = v->ne[3];
+
+    GGML_ASSERT(states->type == GGML_TYPE_F32 && ggml_is_contiguous(states));
+    GGML_ASSERT(states->ne[0] == S_v * S_v * H && states->ne[2] == 1 && states->ne[3] == 1);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[0] == n_seqs && ggml_nelements(ids) == n_seqs);
+
+    // the shape checks of the plain op run against a [S_v, S_v, H, n_seqs] view of the first rows (the view is not
+    // part of the graph: src[5] is then replaced with the whole cache)
+    GGML_ASSERT(states->ne[1] >= n_seqs);
+    struct ggml_tensor * s0 = ggml_view_4d(ctx, states, S_v, S_v, H, n_seqs,
+            S_v * sizeof(float), S_v * S_v * sizeof(float), states->nb[1], 0);
+
+    struct ggml_tensor * result = ggml_gated_delta_net_replay(ctx, q, k, v, g, beta, s0, n_replay, commit_at);
+
+    result->src[5] = states;
+    result->src[6] = ids;
+
+    return result;
+}
+
+// ggml_dflash_conv (infernet)
+
+struct ggml_tensor * ggml_dflash_conv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * hidden,
+        struct ggml_tensor  * dynamic,
+        struct ggml_tensor  * base,
+        int                   side,
+        int64_t               block_size,
+        int64_t               group_size) {
+    const int64_t H = hidden->ne[0];
+    const int64_t n_tokens = hidden->ne[1];
+    const int64_t K = base->ne[1];
+
+    GGML_ASSERT(hidden->type == GGML_TYPE_F32 && dynamic->type == GGML_TYPE_F32 && base->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_rows(hidden) && ggml_is_contiguous_rows(dynamic) && ggml_is_contiguous(base));
+    GGML_ASSERT(hidden->ne[2] == 1 && hidden->ne[3] == 1 && dynamic->ne[2] == 1 && dynamic->ne[3] == 1);
+    GGML_ASSERT(group_size > 0 && H % group_size == 0 && block_size > 0 && n_tokens % block_size == 0);
+    GGML_ASSERT(base->ne[0] == H && base->ne[2] == 2 && K >= 1 && side >= 0 && side < 2);
+    GGML_ASSERT(dynamic->ne[0] == (H / group_size) * K * 2 && dynamic->ne[1] == n_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, H, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, side);
+    ggml_set_op_params_i32(result, 1, (int32_t) block_size);
+    ggml_set_op_params_i32(result, 2, (int32_t) group_size);
+
+    result->op     = GGML_OP_DFLASH_CONV;
+    result->src[0] = hidden;
+    result->src[1] = dynamic;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_gdn_replay_prep (infernet)
+
+struct ggml_tensor * ggml_gdn_replay_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * rrow,
+        struct ggml_tensor  * x_new,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * dt,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * conv_k,
+        struct ggml_tensor  * idx_conv,
+        struct ggml_tensor  * idx_gb,
+        int64_t               n_replay,
+        int64_t               commit_at) {
+    const int64_t C = x_new->ne[0];
+    const int64_t N = x_new->ne[1];
+    const int64_t H = alpha->ne[0];
+    const int64_t W = conv_k->ne[0] - 1;
+    const int64_t R = n_replay;
+    const int64_t T = R + N;
+
+    GGML_ASSERT(rrow->type == GGML_TYPE_F32 && x_new->type == GGML_TYPE_F32 && alpha->type == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type == GGML_TYPE_F32 && dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32);
+    GGML_ASSERT(conv_k->type == GGML_TYPE_F32 && idx_conv->type == GGML_TYPE_I32 && idx_gb->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(rrow) && ggml_is_contiguous(x_new) && ggml_is_contiguous(conv_k));
+    GGML_ASSERT(ggml_nelements(rrow) == (W + R)*C + 2*H*(R + 1));
+    GGML_ASSERT(ggml_nrows(x_new) == N && conv_k->ne[1] == C);
+    GGML_ASSERT(alpha->nb[0] == sizeof(float) && ggml_nelements(alpha) == H*N);
+    GGML_ASSERT(beta->nb[0]  == sizeof(float) && beta->ne[0] == H && ggml_nelements(beta) == H*N);
+    GGML_ASSERT(ggml_nelements(dt) == H && ggml_nelements(a) == H);
+    GGML_ASSERT(idx_conv->ne[0] == W + T && idx_gb->ne[0] == T);
+    GGML_ASSERT(0 <= commit_at && commit_at <= T);
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, C*T + 2*H*T + C*W);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) R);
+    ggml_set_op_params_i32(result, 1, (int32_t) commit_at);
+
+    result->op     = GGML_OP_GDN_REPLAY_PREP;
+    result->src[0] = rrow;
+    result->src[1] = x_new;
+    result->src[2] = alpha;
+    result->src[3] = beta;
+    result->src[4] = dt;
+    result->src[5] = a;
+    result->src[6] = conv_k;
+    result->src[7] = idx_conv;
+    result->src[8] = idx_gb;
 
     return result;
 }

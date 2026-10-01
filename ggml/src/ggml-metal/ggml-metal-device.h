@@ -91,6 +91,11 @@ void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder);
 
 void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder);
 
+// infernet SME co-attention: end the encoder, encode a signal (or a wait) of a shared event (id<MTLSharedEvent>) in the
+// command buffer, then continue in a new encoder of the same dispatch type (the encoder object is replaced in place)
+void ggml_metal_encoder_split_signal(ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, void * event, uint64_t value, bool concurrent);
+void ggml_metal_encoder_split_wait  (ggml_metal_encoder_t encoder, ggml_metal_cmd_buf_t cmd_buf, void * event, uint64_t value, bool concurrent);
+
 //
 // MTLLibrary wrapper
 //
@@ -128,12 +133,16 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max 
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexer (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv          (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t nc, bool use_silu);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dflash_conv      (ggml_metal_library_t lib);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_rf_swiglu (ggml_metal_library_t lib, const struct ggml_tensor * op, bool ksplit);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gdn_replay_prep  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv_batched  (ggml_metal_library_t lib, const struct ggml_tensor * op, int ssm_conv_bs, int32_t nc, bool use_silu);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan          (ggml_metal_library_t lib, const struct ggml_tensor * op, bool tail);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_scan_ssd_mma  (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rwkv              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_gated_delta_net   (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_solve_tri         (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_rf         (ggml_metal_library_t lib, const struct ggml_tensor * op, bool ksplit);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext        (ggml_metal_library_t lib, const struct ggml_tensor * op, int nsg, int nxpsg, int r1ptg);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv            (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -158,6 +167,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_l2_norm  
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_group_norm        (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm              (ggml_metal_library_t lib, const struct ggml_tensor * op, int32_t n_fuse);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_norm_scale        (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_add_norm          (ggml_metal_library_t lib);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rope              (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_im2col            (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_conv_transpose_1d (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -188,6 +198,11 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         ggml_metal_library_t lib,
         const struct ggml_tensor * op);
 
+// prefill FA on the matrix units (tensor API only): name = "kernel_flash_attn_ext_pna" or "..._pna_q16"
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_by_name(
+        ggml_metal_library_t lib,
+        const char * name);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_blk(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
@@ -203,6 +218,8 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         bool    has_scap,
         bool    has_kvpad,
         int32_t nsg,
+        int32_t nwg,
+        int32_t ncpsg,
         bool    use_kv_f16,
         int32_t ns10,
         int32_t ns20);
@@ -228,11 +245,29 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_att
         int32_t ns10,
         int32_t ns20);
 
+// GQA verify kernel (GGML_METAL_FA_GQA)
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_gqa(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op,
+        int32_t ncpsg,
+        int variant); // 0 padded tile, 1 unpadded 16 KB tile (_np), 2 separate K/V tiles (_kvs); 1/2 are pf1 only // keys per staged tile: 32
+
+// GQA verify kernel v2 (GGML_METAL_FA_GQA=2): f16 / q8_0, dk = dv = 256
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_gqa2(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
+// GQA verify kernel v2 (GGML_METAL_FA_GQA=2): f16 / q8_0, dk = dv = 256
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_gqa2(
+        ggml_metal_library_t lib,
+        const struct ggml_tensor * op);
+
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const struct ggml_tensor * op,
         int32_t dv,
         int32_t nwg);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_coattn_scatter(ggml_metal_library_t lib);
 
 // MTLResidencySet wrapper
 
@@ -313,6 +348,9 @@ void ggml_metal_device_free(ggml_metal_device_t dev);
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices);
 
 void * ggml_metal_device_get_obj  (ggml_metal_device_t dev); // id<MTLDevice>
+
+// infernet: GPU core count from the IORegistry ("gpu-core-count" of the AGX accelerator), 0 if unknown (e.g. iOS)
+int ggml_metal_gpu_core_count(void);
 void * ggml_metal_device_get_queue(ggml_metal_device_t dev); // id<MTLCommandQueue>
 
 ggml_metal_library_t ggml_metal_device_get_library(ggml_metal_device_t dev);

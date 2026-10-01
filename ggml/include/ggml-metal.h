@@ -56,6 +56,15 @@ GGML_BACKEND_API void ggml_backend_metal_capture_next_compute(ggml_backend_t bac
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metal_reg(void);
 
+// infernet: residency of all Metal memory. release = true: END it after GGML_METAL_RESIDENCY_KEEP_ALIVE_S without a graph (the memory
+// is unwired until the next graph, which requests it again; iOS re-wiring a 5 GB model costs ~3 s), false: keep it (default, unless
+// GGML_METAL_RESIDENCY_RELEASE=1). prewarm: request it now (e.g. when a prefill is known to be coming).
+GGML_BACKEND_API void ggml_backend_metal_set_residency_release(bool release);
+GGML_BACKEND_API void ggml_backend_metal_residency_prewarm(void);
+// release_now: with release on, end the residency on the next heartbeat (~5 ms) instead of after the keep-alive (e.g. the memory is
+// wanted for something else right now); the next graph requests it again
+GGML_BACKEND_API void ggml_backend_metal_residency_release_now(void);
+
 #ifdef __cplusplus
 }
 #endif

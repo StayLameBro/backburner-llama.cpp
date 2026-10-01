@@ -601,6 +601,9 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_GDN_REPLAY_PREP, // infernet: appended so older op ids (RPC) keep their values
+        GGML_OP_DFLASH_CONV,     // infernet: appended (same reason)
+
         GGML_OP_COUNT,
     };
 
@@ -2658,6 +2661,86 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // infernet replay rollback: same recurrence, one state out (K == 1), no per-token snapshots.
+    //   - the first n_replay tokens only update the state: the output has attention rows for the
+    //     last (n_tokens - n_replay) tokens only: [S_v, H_v, n_tokens - n_replay, n_seqs], then 1 state
+    //   - the state written out is the one after the first commit_at tokens (0 <= commit_at <= n_tokens;
+    //     commit_at == n_tokens = the final state, as ggml_gated_delta_net with K == 1)
+    //   - a replay token (t < n_replay) with beta == 0 and a scalar gate g == 0 is an exact identity
+    //     (S*exp(0) = S, S + k*0 = S) and may be skipped: used to pad a variable replay count to a fixed shape
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            int64_t               n_replay,
+            int64_t               commit_at);
+
+    // infernet: ggml_gated_delta_net_replay reading s0 straight from the recurrent cache (no gathered copy):
+    //   states [S_v*S_v*H_v, n_cells] F32, ids [n_seqs] I32: s0 of seq s is row ids[s] of states
+    // the output may be written back into the same cache rows (Metal GDN_CACHE fusion): every state value is read
+    // by the thread that later overwrites it, so reading and writing one cell in the same kernel is race-free
+    // infernet: q and k go in raw and are L2-normalized per row on load, exactly as build_gdn_l2_norm:
+    //   x * (1/sqrt(sum(x^2)/S_k + eps)) * (1/sqrt(S_k))   (eps = the rms eps divided by S_k)
+    // saves the two norm launches and a barrier level per layer
+    GGML_API void ggml_gated_delta_net_set_l2(struct ggml_tensor * gdn, float eps);
+
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * ids,
+            int64_t               n_replay,
+            int64_t               commit_at);
+
+    // infernet: the input side of one GDN replay-rollback step in one op (replaces CONCAT + GET_ROWS + CONT + SSM_CONV + SILU
+    // for the conv, and ADD + SOFTPLUS + MUL / SIGMOID + CONCAT + GET_ROWS for g and beta: ~12 launches per layer -> 1).
+    //   rrow      [(W + R)*C + 2*H*(R + 1)]  the cell's r row: conv pool (W + R columns of C), g log [H, R + 1], beta log [H, R + 1]
+    //   x_new     [C, N]                     raw in-proj output of the N new tokens
+    //   alpha     [H, N]                     raw alpha projection (rows may be strided)
+    //   beta      [H, N]                     raw beta projection  (rows may be strided)
+    //   dt, a     [H]                        g = softplus(alpha + dt) * a, beta = sigmoid(beta)
+    //   conv_k    [W + 1, C]                 conv kernel
+    //   idx_conv  [W + R + N] i32            pool column per conv input column (pool = [conv pool | x_new])
+    //   idx_gb    [R + N]     i32            log row per step (log = [g log | g_new])
+    // result: F32 [C*T + 2*H*T + C*W], T = R + N, packed as
+    //   conv_out [C, T] = silu(conv), g_all [H, T], b_all [H, T], win [C, W] = gathered conv columns [commit_at, commit_at + W)
+    GGML_API struct ggml_tensor * ggml_gdn_replay_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * rrow,
+            struct ggml_tensor  * x_new,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * dt,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * conv_k,
+            struct ggml_tensor  * idx_conv,
+            struct ggml_tensor  * idx_gb,
+            int64_t               n_replay,
+            int64_t               commit_at);
+
+    // infernet: the DFlash2 drafter's dynamic causal conv in one op (replaces CONT + REPEAT + ADD, then per tap FILL + CONCAT
+    // + CONT + MUL + ADD). Per channel c and token t (tb = t % block_size, g = c / group_size), in this order:
+    //   w_tap = dynamic[g + n_groups*(tap + K*side), t] + base[c, tap, side]
+    //   r = w_0 * hidden[c, t];  r = r + w_tap * (tb >= tap ? hidden[c, t - tap] : 0)   for tap = 1 .. K-1
+    //   hidden  [H, n_tokens]            dynamic [n_groups*K*2, n_tokens]            base [H, K, 2]
+    // result: F32 [H, n_tokens]
+    GGML_API struct ggml_tensor * ggml_dflash_conv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * hidden,
+            struct ggml_tensor  * dynamic,
+            struct ggml_tensor  * base,
+            int                   side,
+            int64_t               block_size,
+            int64_t               group_size);
 
     // DSA lightning indexer
     //

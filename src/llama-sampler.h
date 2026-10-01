@@ -38,6 +38,10 @@ struct llama_sampler_chain {
 uint32_t llama_sampler_backend_n_nodes(const llama_sampler * sampler);
 void llama_sampler_backend_begin(llama_sampler * sampler);
 
+// infernet: the sampler always picks argmax(logits) (see llama-sampler.cpp)
+bool llama_sampler_is_greedy_equiv(const struct llama_sampler * smpl);
+bool llama_sampler_is_logit_bias(const struct llama_sampler * smpl);
+
 struct llama_sampler * llama_sampler_init_dry_testing(
         float   dry_multiplier,
         float   dry_base,

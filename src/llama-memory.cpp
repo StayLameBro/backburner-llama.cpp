@@ -57,3 +57,8 @@ bool llama_memory_status_is_fail(llama_memory_status status) {
 
     return false;
 }
+
+llama_state_filter & llama_state_filter_cur() {
+    static thread_local llama_state_filter f;
+    return f;
+}

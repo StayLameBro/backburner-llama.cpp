@@ -1,0 +1,1 @@
+Question about the source above. In scripts/gpu-lock-common.sh and scripts/decode-bench.sh, how is the shared GPU lock implemented, what happens when a lock is stale or another llama process is already running, and which environment variables and default values control a benchmark run? Answer in detail, citing the exact function and variable names.

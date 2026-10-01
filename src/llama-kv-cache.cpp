@@ -367,6 +367,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    if (remote && n_remote > 0) {
+        remote_truncate(0);
+    }
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -387,6 +391,18 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 
     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+
+    // phone-held KV: the phone can only drop a tail of its keys
+    if (remote && n_remote > 0 && (seq_id == -1 || seq_id == 0) && std::max<llama_pos>(p0, 0) < (llama_pos) n_remote) {
+        if (p1 >= 0 && p1 <= seq_pos_max(0)) {
+            LLAMA_LOG_WARN("%s: phone-held KV: cannot remove positions [%d, %d) from the middle of the context\n", __func__, p0, p1);
+            return false;
+        }
+        if (!remote_truncate(p0)) {
+            // some phone positions below p0 were lost: the caller must drop the sequence
+            return false;
+        }
+    }
 
     if (p0 < 0) {
         p0 = 0;
@@ -663,6 +679,11 @@ llama_pos llama_kv_cache::seq_pos_min(llama_seq_id seq_id) const {
     }
 
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    // phone-held KV: positions [0, n_remote) are still part of the sequence, they just live on the phone
+    if (remote && n_remote > 0 && seq_id == 0) {
+        return 0;
+    }
 
     const auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1186,6 +1207,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    if (remote) {
+        return false;   // phone-held KV: the phone's keys can't be shifted
+    }
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -2056,6 +2080,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
         return;
     }
 
+    if (remote && n_remote > 0 && (seq_id == -1 || seq_id == 0)) {
+        throw std::runtime_error("phone-held KV: saving a state while the phone holds keys is not supported yet");
+    }
+
     GGML_UNUSED(flags);
 
     io.write(&n_stream, sizeof(n_stream));
@@ -2076,6 +2104,7 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 
             add_cell = add_cell && !cells.is_empty(i);
             add_cell = add_cell && (seq_id == -1 || cells.seq_has(i, seq_id));
+            add_cell = add_cell && llama_state_filter_cur().pos_in(cells.pos_get(i));
 
             // check the cell is not SWA-masked
             if (add_cell && seq_id != -1) {
@@ -2121,6 +2150,10 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
 }
 
 void llama_kv_cache::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
+    // phone-held KV: the state being read replaces the sequence, including what the phone held
+    if (remote && n_remote > 0 && (seq_id == -1 || seq_id == 0)) {
+        remote_truncate(0);
+    }
     state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
 }
 
@@ -2236,8 +2269,13 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
     const auto & cells = v_cells[cr.strm];
 
+    const auto & flt = llama_state_filter_cur();
+
     const uint32_t v_trans = this->v_trans ? 1 : 0;
-    const uint32_t n_layer = layers.size();
+    uint32_t n_layer = 0;
+    for (const auto & layer : layers) {
+        n_layer += flt.layer_in(layer.il) ? 1 : 0;
+    }
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
@@ -2246,6 +2284,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     // Get whole range at a time
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        if (!flt.layer_in(il)) {
+            continue;
+        }
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -2270,6 +2311,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     if (!v_trans) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (!flt.layer_in(il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2299,6 +2343,9 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
 
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (!flt.layer_in(il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2336,9 +2383,15 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
     auto & cells = v_cells[strm];
     auto & head  = v_heads[strm];
 
+    const auto & flt = llama_state_filter_cur();
+    const bool keep_seq  = flt.active && flt.kv_mode != llama_state_filter::REPLACE;
+    const bool overwrite = flt.active && flt.kv_mode == llama_state_filter::OVERWRITE;
+
     if (dest_seq_id != -1) {
         // single sequence
-        seq_rm(dest_seq_id, -1, -1);
+        if (!keep_seq) {
+            seq_rm(dest_seq_id, -1, -1);
+        }
 
         llama_batch_allocr balloc(hparams.n_pos_per_embd());
 
@@ -2388,6 +2441,83 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             ubatch.pos[i]      = pos;
             ubatch.n_seq_id[i] = n_seq_id;
             ubatch.seq_id[i]   = &dest_seq_id;
+        }
+
+        if (overwrite) {
+            // the cells exist already (this sequence, same positions): only their rows are replaced by state_read_data
+            std::unordered_map<llama_pos, uint32_t> at;
+            for (uint32_t c = 0; c < cells.size(); ++c) {
+                if (!cells.is_empty(c) && cells.seq_has(c, dest_seq_id)) {
+                    at[cells.pos_get(c)] = c;
+                }
+            }
+            sinfo.s0 = strm;
+            sinfo.s1 = strm;
+            sinfo.strm.assign(1, (llama_seq_id) strm);
+            sinfo.idxs.assign(1, {});
+            sinfo.idxs[0].reserve(cell_count);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                const auto it = at.find(ubatch.pos[i]);
+                if (it == at.end()) {
+                    LLAMA_LOG_ERROR("%s: overwrite: seq %d has no cell at pos %d\n", __func__, dest_seq_id, ubatch.pos[i]);
+                    return false;
+                }
+                sinfo.idxs[0].push_back(it->second);
+            }
+            return true;
+        }
+
+        // phone-held KV: a state bigger than the free Mac cells sends its oldest positions straight to the phone
+        rr_n_ph = 0;
+        rr_route.clear();
+        rr_pos.clear();
+        if (remote && dest_seq_id == 0 && !sinfo_in && cell_count > cells.size() - cells.get_used()) {
+            const uint32_t n_free = cells.size() - cells.get_used();
+            std::vector<char> seen(cell_count, 0);
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                const llama_pos p = ubatch.pos[i];
+                if (p < 0 || (uint32_t) p >= cell_count || seen[p]) {
+                    LLAMA_LOG_ERROR("%s: phone-held KV: the saved sequence is not positions [0, %u)\n", __func__, cell_count);
+                    return false;
+                }
+                seen[p] = 1;
+            }
+            const uint32_t reserve = std::min<uint32_t>(n_free/2, 1024);   // room for the next batch
+            const uint32_t n_ph = std::min(cell_count/64*64, (cell_count - (n_free - reserve) + 63)/64*64);
+            const uint32_t n_mac = cell_count - n_ph;
+            if (n_mac > n_free) {
+                LLAMA_LOG_ERROR("%s: phone-held KV: %u saved cells do not fit (%u free Mac cells)\n", __func__, cell_count, n_free);
+                return false;
+            }
+            const uint32_t np = ubatch.n_pos;
+            llama_ubatch full = ubatch;   // shares its data
+            llama_ubatch red  = balloc.ubatch_reserve(n_mac, 1);
+            red.seq_id_unq[0] = dest_seq_id;
+            std::vector<llama_kv_cell_ext> exts_mac;
+            rr_route.assign(cell_count, -1);
+            rr_pos.assign(cell_count, -1);
+            uint32_t j = 0;
+            for (uint32_t i = 0; i < cell_count; ++i) {
+                if (full.pos[i] < (llama_pos) n_ph) {
+                    rr_pos[i] = full.pos[i];
+                    continue;
+                }
+                rr_route[i] = (int32_t) j;
+                red.token[j] = full.token[i];
+                for (uint32_t d = 0; d < np; ++d) {
+                    red.pos[j + d*n_mac] = full.pos[i + d*cell_count];
+                }
+                red.n_seq_id[j] = 1;
+                red.seq_id[j]   = &dest_seq_id;
+                if (!exts.empty()) {
+                    exts_mac.push_back(exts[i]);
+                }
+                j++;
+            }
+            ubatch = red;
+            exts   = std::move(exts_mac);
+            rr_n_ph = n_ph;
+            LLAMA_LOG_INFO("%s: phone-held KV: restoring %u positions, the oldest %u straight to the phone\n", __func__, cell_count, n_ph);
         }
 
         if (sinfo_in) {
@@ -2440,8 +2570,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
         // DEBUG CHECK: verify that all cells were allocated and have correct seq_id and pos values
         GGML_ASSERT(sinfo.n_stream() == 1);
-        GGML_ASSERT(sinfo.idxs[0].size() == cell_count);
-        for (uint32_t i = 0; i < cell_count; ++i) {
+        GGML_ASSERT(sinfo.idxs[0].size() == ubatch.n_tokens);
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             const uint32_t idx = sinfo.idxs[0][i];
             GGML_ASSERT(cells.pos_get(idx) == ubatch.pos[i]);
             GGML_ASSERT(cells.seq_has(idx, dest_seq_id));
@@ -2506,6 +2636,14 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 }
 
 bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32_t cell_count, const slot_info & sinfo) {
+    if (rr_n_ph > 0) {
+        const bool ok = remote_restore_data(io, cell_count, sinfo);
+        rr_n_ph = 0;
+        rr_route.clear();
+        rr_pos.clear();
+        return ok;
+    }
+
     auto & cells = v_cells[strm];
 
     // batch the scatter reads per contiguous run of destination indices
@@ -2532,8 +2670,14 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     io.read(&v_trans, sizeof(v_trans));
     io.read(&n_layer, sizeof(n_layer));
 
-    if (n_layer != layers.size()) {
-        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, (uint32_t) layers.size());
+    const auto & flt = llama_state_filter_cur();
+    uint32_t n_layer_want = 0;
+    for (const auto & layer : layers) {
+        n_layer_want += flt.layer_in(layer.il) ? 1 : 0;
+    }
+
+    if (n_layer != n_layer_want) {
+        LLAMA_LOG_ERROR("%s: mismatched layer count (%u instead of %u)\n", __func__, n_layer, n_layer_want);
         return false;
     }
 
@@ -2550,6 +2694,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     // For each layer, read the keys for each cell, one row is one cell, read as one contiguous block
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
+        if (!flt.layer_in(il)) {
+            continue;
+        }
 
         const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
@@ -2581,6 +2728,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     if (!this->v_trans) {
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (!flt.layer_in(il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2615,6 +2765,9 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
         // For each layer, read the values for each cell (transposed)
         for (const auto & layer : layers) {
             const uint32_t il = layer.il;
+            if (!flt.layer_in(il)) {
+                continue;
+            }
 
             const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
 
@@ -2812,4 +2965,256 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
     kv->get_prev_tokens(ubatch, n, res);
+}
+
+//
+// phone-held KV (infernet)
+//
+
+// must match ggml/src/ggml-metal/ggml-metal-remote.h
+#define LLAMA_KV_REMOTE_OP_PARAM 5
+#define LLAMA_KV_REMOTE_TAG      0x50480000
+
+int32_t llama_kv_cache::remote_attach(const char * host_port) {
+    if (other || n_stream != 1) {
+        LLAMA_LOG_ERROR("%s: phone-held KV needs one stream and its own cells\n", __func__);
+        return -1;
+    }
+    if (v_trans) {
+        LLAMA_LOG_ERROR("%s: phone-held KV needs flash attention (non-transposed V)\n", __func__);
+        return -1;
+    }
+    if (layers.empty() || map_layer_ids.size() != layers.size()) {
+        LLAMA_LOG_ERROR("%s: phone-held KV does not support shared KV layers\n", __func__);
+        return -1;
+    }
+    const ggml_type t = layers[0].k->type;
+    if (t != GGML_TYPE_F16 && t != GGML_TYPE_Q8_0 && t != GGML_TYPE_Q4_0) {
+        LLAMA_LOG_ERROR("%s: phone-held KV supports f16, q8_0, and q4_0 K/V, not %s\n", __func__, ggml_type_name(t));
+        return -1;
+    }
+    const uint32_t il0 = layers[0].il;
+    const int64_t n_head_kv = hparams.n_head_kv(il0);
+    if (hparams.n_embd_head_k(il0) != 256 || hparams.n_embd_head_v(il0) != 256 || n_head_kv*6 != hparams.n_head(il0)) {
+        LLAMA_LOG_ERROR("%s: phone-held KV supports head dim 256 with 6 query heads per KV head\n", __func__);
+        return -1;
+    }
+    const size_t rs = layers[0].k->nb[1];
+    std::vector<int32_t> ils;
+    for (const auto & l : layers) {
+        if (l.k->type != t || l.v->type != t || l.k->nb[1] != rs || l.v->nb[1] != rs ||
+            hparams.n_head_kv(l.il) != n_head_kv || l.k->ne[0] != n_head_kv*256) {
+            LLAMA_LOG_ERROR("%s: phone-held KV needs identical K/V rows in every layer\n", __func__);
+            return -1;
+        }
+        ils.push_back((int32_t) l.il);
+    }
+
+    ggml_backend_reg_t reg = nullptr;
+    void * fn_attach = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count() && !fn_attach; ++i) {
+        reg = ggml_backend_reg_get(i);
+        fn_attach = ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_attach");
+    }
+    if (!fn_attach) {
+        LLAMA_LOG_ERROR("%s: phone-held KV needs the Metal backend of this build\n", __func__);
+        return -1;
+    }
+    remote_append_fn   = (int (*)(int, uint32_t, uint32_t, const void *, const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_append");
+    remote_truncate_fn = (int (*)(uint32_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_truncate");
+    remote_big_fn      = (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_big");
+    auto attach = (int (*)(const char *, int, const int32_t *, int, size_t, size_t, int)) fn_attach;
+    if (!remote_append_fn || !remote_truncate_fn ||
+        attach(host_port, (int) ils.size(), ils.data(), (int) n_head_kv, rs, ggml_row_size(t, 256), t == GGML_TYPE_Q8_0 ? 1 : t == GGML_TYPE_Q4_0 ? 2 : 0) != 0) {
+        return -1;
+    }
+    remote   = true;
+    n_remote = 0;
+    LLAMA_LOG_INFO("%s: phone-held KV attached (%s): %zu layers, %s rows of %zu bytes\n", __func__, host_port, ils.size(), ggml_type_name(t), rs);
+    return 0;
+}
+
+bool llama_kv_cache::remote_truncate(llama_pos p) {
+    const uint32_t want = std::min<uint32_t>(n_remote, (uint32_t) std::max<llama_pos>(p, 0));
+    const uint32_t keep = want/64*64;
+    if (remote_truncate_fn(keep) != 0) {
+        LLAMA_LOG_ERROR("%s: phone-held KV: truncating the phone to %u failed\n", __func__, keep);
+    }
+    n_remote = keep;
+    return keep == want;
+}
+
+int32_t llama_kv_cache::remote_evict(uint32_t n) {
+    if (!remote) {
+        return -1;
+    }
+    n = n/64*64;   // the phone computes in blocks of 64 keys
+    if (n == 0) {
+        return 0;
+    }
+
+    auto & cells = v_cells[0];
+    const llama_pos p0 = (llama_pos) n_remote;
+    const llama_pos p1 = p0 + (llama_pos) n;
+
+    // the cells holding positions [p0, p1) of sequence 0, in position order
+    std::vector<int64_t> cell_of(n, -1);
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        if (cells.is_empty(i) || !cells.seq_has(i, 0) || !cells.pos_in(i, p0, p1)) {
+            continue;
+        }
+        if (cells.seq_count(i) != 1) {
+            LLAMA_LOG_ERROR("%s: phone-held KV: cell %u is shared by several sequences (v1 supports one)\n", __func__, i);
+            return -1;
+        }
+        cell_of[cells.pos_get(i) - p0] = i;
+    }
+    for (uint32_t j = 0; j < n; ++j) {
+        if (cell_of[j] < 0) {
+            LLAMA_LOG_ERROR("%s: phone-held KV: position %d is not in the Mac cache\n", __func__, p0 + (llama_pos) j);
+            return -1;
+        }
+    }
+
+    const size_t rs = layers[0].k->nb[1];
+    std::vector<uint8_t> K((size_t) n*rs), V((size_t) n*rs);
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        for (uint32_t j = 0; j < n; ) {
+            uint32_t r = 1;
+            while (j + r < n && cell_of[j + r] == cell_of[j] + r) {
+                r++;
+            }
+            ggml_backend_tensor_get(layers[ikv].k, K.data() + (size_t) j*rs, (size_t) cell_of[j]*rs, (size_t) r*rs);
+            ggml_backend_tensor_get(layers[ikv].v, V.data() + (size_t) j*rs, (size_t) cell_of[j]*rs, (size_t) r*rs);
+            j += r;
+        }
+        if (remote_append_fn((int) ikv, (uint32_t) p0, n, K.data(), V.data()) != 0) {
+            remote_truncate_fn(n_remote);   // undo the layers already sent
+            return -1;
+        }
+    }
+
+    // debug: LLAMA_KV_REMOTE_POISON=1 zeroes the freed cells' K/V on the Mac (a correct mask never reads them)
+    if (getenv("LLAMA_KV_REMOTE_POISON")) {
+        std::vector<uint8_t> z(rs, 0);
+        for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+            for (uint32_t j = 0; j < n; ++j) {
+                ggml_backend_tensor_set(layers[ikv].k, z.data(), (size_t) cell_of[j]*rs, rs);
+                ggml_backend_tensor_set(layers[ikv].v, z.data(), (size_t) cell_of[j]*rs, rs);
+            }
+        }
+    }
+    auto & head = v_heads[0];
+    for (uint32_t j = 0; j < n; ++j) {
+        cells.seq_rm((uint32_t) cell_of[j], 0);
+        head = std::min<uint32_t>(head, (uint32_t) cell_of[j]);
+    }
+    n_remote += n;
+
+    LLAMA_LOG_DEBUG("%s: phone-held KV: moved positions [%d, %d) to the phone\n", __func__, p0, p1);
+    return (int32_t) n;
+}
+
+int32_t llama_kv_cache::remote_tag(int32_t il) const {
+    return remote && map_layer_ids.count(il) ? (int32_t) (LLAMA_KV_REMOTE_TAG | (uint32_t) (il + 1)) : 0;
+}
+
+int32_t llama_kv_cache_context::remote_tag(int32_t il) const {
+    return kv->remote_tag(il);
+}
+
+bool llama_kv_cache_context::remote_big() const {
+    return kv->remote_n() > 0 && kv->remote_big();
+}
+
+bool llama_kv_cache_context::remote_tag_any() const {
+    return kv->remote_on();
+}
+
+uint32_t llama_kv_cache::remote_n_free() const {
+    return v_cells[0].size() - v_cells[0].get_used();
+}
+
+bool llama_kv_cache::remote_make_room(uint32_t n) {
+    static uint32_t page = 0;
+    if (page == 0) {
+        const char * e = getenv("LLAMA_KV_REMOTE_PAGE");
+        page = std::max<uint32_t>(64, (e ? (uint32_t) atoi(e) : 4096u)/64*64);
+    }
+    while (remote_n_free() < n) {
+        const llama_pos pmax = seq_pos_max(0);
+        const uint32_t on_mac = pmax < 0 ? 0 : (uint32_t) (pmax + 1) - n_remote;   // Mac-held positions of seq 0
+        const uint32_t want = std::max(page, (n - remote_n_free() + 63)/64*64);
+        const uint32_t take = std::min(want, on_mac/64*64);
+        if (take == 0 || remote_evict(take) != (int32_t) take) {
+            LLAMA_LOG_ERROR("%s: phone-held KV: cannot free %u Mac cells (%u free, %u positions on the Mac)\n",
+                    __func__, n, remote_n_free(), on_mac);
+            return false;
+        }
+        LLAMA_LOG_INFO("%s: phone-held KV: moved %u more positions to the phone (phone %u, Mac %u of %u cells)\n",
+                __func__, take, n_remote, v_cells[0].get_used(), v_cells[0].size());
+    }
+    return true;
+}
+
+bool llama_kv_cache::remote_restore_data(llama_io_read_i & io, uint32_t cell_count, const slot_info & sinfo) {
+    uint32_t v_trans_ref, n_layer_ref;
+    io.read(&v_trans_ref, sizeof(v_trans_ref));
+    io.read(&n_layer_ref, sizeof(n_layer_ref));
+    if (v_trans_ref != 0 || n_layer_ref != layers.size() || llama_state_filter_cur().active) {
+        LLAMA_LOG_ERROR("%s: phone-held KV: unsupported state layout\n", __func__);
+        return false;
+    }
+    const size_t rs = layers[0].k->nb[1];
+    const uint32_t n_ph = rr_n_ph;
+    const auto & idxs = sinfo.idxs[0];
+
+    std::vector<uint8_t> buf((size_t) cell_count*rs);
+    std::vector<std::vector<uint8_t>> phK(layers.size());
+    std::vector<uint8_t> phV;
+
+    // one saved block of rows (K or V of one layer): Mac rows go to their cells in runs, phone rows into ph by position
+    auto route = [&](ggml_tensor * t, std::vector<uint8_t> & ph) -> bool {
+        int32_t type_ref; uint64_t rs_ref;
+        io.read(&type_ref, sizeof(type_ref));
+        io.read(&rs_ref,   sizeof(rs_ref));
+        if (type_ref != (int32_t) t->type || rs_ref != rs) {
+            LLAMA_LOG_ERROR("%s: phone-held KV: mismatched row type/size\n", __func__);
+            return false;
+        }
+        io.read(buf.data(), buf.size());
+        ph.resize((size_t) n_ph*rs);
+        for (uint32_t i = 0; i < cell_count; ) {
+            if (rr_route[i] < 0) {
+                memcpy(ph.data() + (size_t) rr_pos[i]*rs, buf.data() + (size_t) i*rs, rs);
+                i++;
+                continue;
+            }
+            uint32_t r = 1;
+            while (i + r < cell_count && rr_route[i + r] == rr_route[i] + (int32_t) r && idxs[rr_route[i + r]] == idxs[rr_route[i]] + r) {
+                r++;
+            }
+            ggml_backend_tensor_set(t, buf.data() + (size_t) i*rs, (size_t) idxs[rr_route[i]]*rs, (size_t) r*rs);
+            i += r;
+        }
+        return true;
+    };
+
+    for (size_t l = 0; l < layers.size(); ++l) {
+        if (!route(layers[l].k_stream[0], phK[l])) {
+            return false;
+        }
+    }
+    for (size_t l = 0; l < layers.size(); ++l) {
+        if (!route(layers[l].v_stream[0], phV)) {
+            return false;
+        }
+        if (remote_append_fn((int) l, 0, n_ph, phK[l].data(), phV.data()) != 0) {
+            remote_truncate_fn(0);
+            return false;
+        }
+        std::vector<uint8_t>().swap(phK[l]);
+    }
+    n_remote = n_ph;
+    return true;
 }

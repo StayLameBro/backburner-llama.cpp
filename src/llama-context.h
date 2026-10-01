@@ -117,6 +117,9 @@ struct llama_context {
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
+    void set_layer_range(int32_t il_start, int32_t il_end);
+    void set_ffn_offload(int32_t il0, int32_t il1, bool (*fn)(float *, const float *, int32_t, int32_t, int32_t, void *), void * user);
+    bool ffn_offload_failed();
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
@@ -255,7 +258,7 @@ public:
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
 private:
-    llm_graph_result * get_gf_res_prev();
+    llm_graph_result * get_gf_res_prev(const llama_ubatch * ubatch = nullptr);
 
     llm_graph_params graph_params(
                         llm_graph_result * res,
@@ -368,7 +371,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
-    std::array<llm_graph_result_ptr, 2> gf_res_prev;
+    // infernet: slots 2-3 are used only with LLAMA_GRAPH_REUSE2=1 (embedding-input batches get their own slot, so an
+    // alternating embd/token decoder such as the DFlash drafter keeps both graphs and re-activates instead of rebuilding)
+    std::array<llm_graph_result_ptr, 4> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
     llm_graph_result * gf_res_prev_active = nullptr;
@@ -384,6 +389,14 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_GRAPH_REUSE2 (infernet): keep one cached graph per (has outputs, embd input) and re-activate a
+    // non-active cached graph with a scheduler re-alloc instead of a full rebuild
+    bool graph_reuse2 = false;
+    int64_t n_reactivated = 0;
+    // per gf_res_prev slot: every node's src[] as built, before ggml_backend_sched_split_graph rewrote the
+    // cross-backend inputs to its (per-split, since freed) copies; restored before a re-activation re-splits
+    std::array<std::vector<std::pair<ggml_tensor *, std::array<ggml_tensor *, GGML_MAX_SRC>>>, 4> gf_srcs;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;
@@ -397,4 +410,39 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // depth-bench: LLAMA_DECODE_PROF=1 splits small-batch decodes (2..16 tokens) into host pieces and the sync wait
+    struct decode_prof {
+        bool    on = false;
+        int64_t n = 0, n_reuse = 0;
+        int64_t t_pre = 0, t_build = 0, t_inputs = 0, t_submit = 0, t_extract = 0, t_post = 0, t_sync = 0;
+        int64_t b_logits = 0, b_other = 0;
+        bool    active = false; // the last decode was profiled, attribute the next sync to it
+        int     cur_nt = 0;
+        int64_t t_cur0 = 0;
+        int64_t nt_count[17] = {0}, nt_us[17] = {0}, nt_build[17] = {0}; // per batch size: decodes, decode+sync wall, rebuilds
+        int64_t t_mark = 0;
+    } prof;
+
+    // infernet split prefill (llama-split.h/.cpp)
+    std::unique_ptr<struct llama_split_state> split;
+    ggml_type split_type_k = GGML_TYPE_F16;
+    ggml_type split_type_v = GGML_TYPE_F16;
+    void split_init(ggml_type type_k, ggml_type type_v);
+    void split_free();
+    void split_reset_graphs();
+    void split_restore_graph();
+    std::vector<uint8_t> split_get_state(llama_pos p0, llama_pos p1, int32_t il0, int32_t il1, bool kv, bool rs);
+    bool split_set_state(const std::vector<uint8_t> & b, int32_t il0, int32_t il1, int32_t kv_mode, int32_t rs_mode, bool kv, bool rs);
+    int  split_begin(uint32_t n_tokens_all, uint32_t n_outputs_all);
+    bool split_submit(int tok_off, int n_tok, llama_pos pos0);
+    bool split_finish();
+    llm_graph_result * split_tail_local(const llama_ubatch & ubatch, int tok_off, llama_memory_context_i * mctx, ggml_status & status);
+    bool split_skip_apply = false;       // the tail pass of a head-first ubatch reuses the head pass's memory slot
+    std::vector<float> split_resid;      // the residual entering L of the head-first ubatch
+    void split_abort();
+
+    // FFN offload (set_ffn_offload)
+    std::vector<llama_ffn_offload_slot> ffn_off_slots;
+    bool ffn_off_failed = false;
 };

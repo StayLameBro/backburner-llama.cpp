@@ -1,6 +1,9 @@
 find_library(FOUNDATION_LIBRARY Foundation REQUIRED)
 find_library(METAL_FRAMEWORK    Metal      REQUIRED)
 find_library(METALKIT_FRAMEWORK MetalKit   REQUIRED)
+if (APPLE AND NOT IOS)
+    find_library(IOKIT_FRAMEWORK IOKit REQUIRED)   # infernet: GPU core count for the FA_GQA split default
+endif()
 
 message(STATUS "Metal framework found")
 
@@ -13,11 +16,20 @@ ggml_add_backend_library(ggml-metal
                          ggml-metal-fusion.cpp
                          ggml-metal-ops.cpp
                          ggml-metal-tuning.cpp
+                         ggml-metal-coattn.m
+                         ggml-metal-mmsme.m
+                         ggml-metal-remote.mm
                         )
+
+# infernet SME co-attention: SME2 intrinsics (only executed when GGML_METAL_FA_SME is set and FEAT_SME2 is present)
+set_source_files_properties(ggml-metal-coattn.m PROPERTIES COMPILE_OPTIONS "-mcpu=apple-m4")
+# infernet SME prefill matmuls (only executed when GGML_METAL_MM_SME is set and FEAT_SME2 is present)
+set_source_files_properties(ggml-metal-mmsme.m PROPERTIES COMPILE_OPTIONS "-mcpu=apple-m4")
 
 target_link_libraries(ggml-metal PRIVATE
                       ${FOUNDATION_LIBRARY}
                       ${METAL_FRAMEWORK}
+                      $<$<BOOL:${IOKIT_FRAMEWORK}>:${IOKIT_FRAMEWORK}>
                       ${METALKIT_FRAMEWORK}
                       )
 

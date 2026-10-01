@@ -1,6 +1,7 @@
 #include "common.h"
 #include "log.h"
 #include "ngram-map.h"
+#include "infernet-toggles.h"
 
 #include <cinttypes>
 #include <cstdint>
@@ -66,26 +67,36 @@ llama_tokens common_ngram_simple_draft(
         return draft_tokens;
     }
 
-    // pattern search
-    llama_tokens pattern;
-    pattern.reserve(n_draft_min);
-    for (size_t j = cur_len - n_draft_min + 1; j < cur_len; ++j) {
-        pattern.push_back(tokens[j]);
-    }
-    pattern.push_back(sampled); // add the last token to the pattern
-
+    // pattern search. infernet: LLAMA_NGRAM_MIN=<n> (runtime toggle) searches the longest match first, from size_ngram down to n
+    // tokens (the most recent occurrence of the longest suffix wins); unset = the stock fixed size_ngram lookup.
+    const size_t n_min_t = (size_t) std::max(0.0, infernet_toggle("LLAMA_NGRAM_MIN", 0.0));
+    const size_t n_lo    = n_min_t >= 2 && n_min_t < n_draft_min ? n_min_t : n_draft_min;
     size_t match_pos = 0; // we ignore position 0, position 0 == no match
-                          // search backwards, but skip the current match (we are currently there)
-    for (size_t j = cur_len - n_draft_min - 1; j > 0; --j) {
-        bool match = true;
-        for (size_t k = 0; k < pattern.size(); ++k) {
-            if (tokens[j + k] != pattern[k]) {
-                match = false;
+    size_t n_match   = n_draft_min;
+    for (size_t n = n_draft_min; n >= n_lo && match_pos == 0; --n) {
+        llama_tokens pattern;
+        pattern.reserve(n);
+        for (size_t j = cur_len - n + 1; j < cur_len; ++j) {
+            pattern.push_back(tokens[j]);
+        }
+        pattern.push_back(sampled); // add the last token to the pattern
+
+        // search backwards, but skip the current match (we are currently there)
+        for (size_t j = cur_len - n - 1; j > 0; --j) {
+            bool match = true;
+            for (size_t k = 0; k < pattern.size(); ++k) {
+                if (tokens[j + k] != pattern[k]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                match_pos = j;
+                n_match   = n;
                 break;
             }
         }
-        if (match) {
-            match_pos = j;
+        if (n == 0) {
             break;
         }
     }
@@ -95,18 +106,18 @@ llama_tokens common_ngram_simple_draft(
 
     const size_t copy_max = std::min(
             n_draft_max,
-            cur_len - (match_pos + n_draft_min)
+            cur_len - (match_pos + n_match)
             );
-    if (copy_max < n_draft_min) {
+    if (copy_max < (n_min_t ? std::min<size_t>(n_match, 4) : n_draft_min)) {   // stock: needs size_ngram tokens
         return draft_tokens;
     }
     LOG_DBG("%s: #tokens = %zu: found matching pattern at pos %zu, length %zu, draft length %zu\n",
             __func__, cur_len,
-            match_pos, pattern.size(), copy_max);
+            match_pos, n_match, copy_max);
 
     draft_tokens.reserve(copy_max);
     for (size_t j = 0; j < copy_max; ++j) {
-        draft_tokens.push_back(tokens[match_pos + n_draft_min + j]);
+        draft_tokens.push_back(tokens[match_pos + n_match + j]);
     }
     return draft_tokens;
 }

@@ -654,54 +654,71 @@ socket_ptr socket_t::accept() {
 }
 
 socket_ptr socket_t::create_server(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (!is_valid_fd(sockfd)) {
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    hints.ai_flags = AI_PASSIVE;
+    struct addrinfo * addresses = nullptr;
+    const std::string service = std::to_string(port);
+    if (getaddrinfo(host, service.c_str(), &hints, &addresses) != 0) {
+        GGML_LOG_ERROR("Cannot resolve bind host '%s'\n", host);
         return nullptr;
     }
-    if (!set_reuse_addr(sockfd)) {
-        GGML_LOG_ERROR("Failed to set SO_REUSEADDR\n");
-        return nullptr;
-    }
-    if (inet_addr(host) == INADDR_NONE) {
-        GGML_LOG_ERROR("Invalid host address: %s\n", host);
-        return nullptr;
-    }
-    struct sockaddr_in serv_addr;
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_addr.s_addr = inet_addr(host);
-    serv_addr.sin_port = htons(port);
 
-    if (bind(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0) {
-        return nullptr;
+    socket_ptr result;
+    for (struct addrinfo * address = addresses; address != nullptr; address = address->ai_next) {
+        auto sockfd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (!is_valid_fd(sockfd)) {
+            continue;
+        }
+        if (set_reuse_addr(sockfd) &&
+            bind(sockfd, address->ai_addr, (socklen_t) address->ai_addrlen) == 0 &&
+            listen(sockfd, 1) == 0) {
+            result = socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+            break;
+        }
+#ifdef _WIN32
+        closesocket(sockfd);
+#else
+        close(sockfd);
+#endif
     }
-    if (listen(sockfd, 1) < 0) {
-        return nullptr;
-    }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    freeaddrinfo(addresses);
+    return result;
 }
 
 socket_ptr socket_t::connect(const char * host, int port) {
-    auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (!is_valid_fd(sockfd)) {
-        return nullptr;
-    }
-    if (!set_no_delay(sockfd)) {
-        GGML_LOG_ERROR("Failed to set TCP_NODELAY\n");
-        return nullptr;
-    }
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(port);
-    struct hostent * server = gethostbyname(host);
-    if (server == NULL) {
+    struct addrinfo hints = {};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_protocol = IPPROTO_TCP;
+    struct addrinfo * addresses = nullptr;
+    const std::string service = std::to_string(port);
+    if (getaddrinfo(host, service.c_str(), &hints, &addresses) != 0) {
         GGML_LOG_ERROR("Cannot resolve host '%s'\n", host);
         return nullptr;
     }
-    memcpy(&addr.sin_addr.s_addr, server->h_addr, server->h_length);
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        return nullptr;
+
+    socket_ptr result;
+    for (struct addrinfo * address = addresses; address != nullptr; address = address->ai_next) {
+        auto sockfd = socket(address->ai_family, address->ai_socktype, address->ai_protocol);
+        if (!is_valid_fd(sockfd)) {
+            continue;
+        }
+        if (set_no_delay(sockfd) &&
+            ::connect(sockfd, address->ai_addr, (socklen_t) address->ai_addrlen) == 0) {
+            result = socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+            break;
+        }
+#ifdef _WIN32
+        closesocket(sockfd);
+#else
+        close(sockfd);
+#endif
     }
-    return socket_ptr(new socket_t(std::make_unique<impl>(sockfd)));
+    freeaddrinfo(addresses);
+    return result;
 }
 
 #ifdef _WIN32

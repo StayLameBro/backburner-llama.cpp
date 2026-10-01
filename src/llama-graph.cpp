@@ -19,6 +19,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -340,6 +341,62 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    set_input_replay(mctx);
+}
+
+static void llm_graph_fill_rp_idx(ggml_tensor * rp_idx_conv, ggml_tensor * rp_idx_gb, int64_t R, int64_t c);
+
+void llm_graph_input_rs::set_input_replay(const llama_memory_recurrent_context * mctx_r) const {
+    // (a pipelined prefill graph uses its halves' indices instead: then these are not in the graph and have no buffer)
+    if (rp_idx_conv == nullptr || rp_idx_conv->buffer == nullptr) {
+        return;
+    }
+    llm_graph_fill_rp_idx(rp_idx_conv, rp_idx_gb, mctx_r->get_rp_cap(), mctx_r->get_rp_c());
+}
+
+void llm_graph_input_rp_half::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (rp_idx_conv == nullptr || rp_idx_conv->buffer == nullptr) {
+        return;
+    }
+    llm_graph_fill_rp_idx(rp_idx_conv, rp_idx_gb, mctx->get_rp_cap(), first ? mctx->get_rp_c() : 0);
+}
+
+static void llm_graph_fill_rp_idx(ggml_tensor * rp_idx_conv, ggml_tensor * rp_idx_gb, int64_t R, int64_t c) {
+    const int64_t N = rp_idx_gb->ne[0] - R;
+    const int64_t W = rp_idx_conv->ne[0] - R - N; // conv window length (d_conv - 1)
+
+    GGML_ASSERT(R > 0 && N > 0 && W > 0 && 0 <= c && c <= R);
+    GGML_ASSERT(ggml_backend_buffer_is_host(rp_idx_conv->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(rp_idx_gb->buffer));
+
+    // conv pool rows: [0, W) window, [W, W + R) log, [W + R, W + R + N) new tokens
+    // sequence: (R - c) pads | window | c logged | N new; a pad column only feeds pad tokens (g = beta = 0)
+    int32_t * ic = (int32_t *) rp_idx_conv->data;
+    int64_t p = 0;
+    for (int64_t i = 0; i < R - c; ++i) { ic[p++] = 0; }
+    for (int64_t i = 0; i < W;     ++i) { ic[p++] = (int32_t) i; }
+    for (int64_t i = 0; i < c;     ++i) { ic[p++] = (int32_t) (W + i); }
+    for (int64_t i = 0; i < N;     ++i) { ic[p++] = (int32_t) (W + R + i); }
+    GGML_ASSERT(p == rp_idx_conv->ne[0]);
+
+    // g/beta pool rows: [0, R) log, R zero (pad), [R + 1, R + 1 + N) new tokens
+    int32_t * ig = (int32_t *) rp_idx_gb->data;
+    p = 0;
+    for (int64_t i = 0; i < R - c; ++i) { ig[p++] = (int32_t) R; }
+    for (int64_t i = 0; i < c;     ++i) { ig[p++] = (int32_t) i; }
+    for (int64_t i = 0; i < N;     ++i) { ig[p++] = (int32_t) (R + 1 + i); }
+    GGML_ASSERT(p == rp_idx_gb->ne[0]);
+}
+
+bool llm_graph_input_rs::can_reuse_replay(const llama_memory_recurrent_context * mctx_r, const llama_ubatch & ubatch) const {
+    const uint32_t R = mctx_r->get_rp_cap();
+    if (R == 0) {
+        return rp_idx_conv == nullptr;
+    }
+    // same R and N -> same graph (lazy/eager depends only on N); c lives in the index data
+    return rp_idx_conv != nullptr && rp_idx_gb->ne[0] == (int64_t) (R + ubatch.n_seq_tokens) && ubatch.n_seqs == 1;
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -356,6 +413,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    res &= can_reuse_replay(mctx, params.ubatch);
 
     return res;
 }
@@ -497,6 +556,9 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
 
     res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+
+    // phone-held KV: a graph built with (without) the 8-token split can't serve a ubatch that needs the other shape
+    res &= remote_split == (params.ubatch.n_tokens > 8 && mctx->remote_tag_any() && mctx->remote_big());
 
     return res;
 }
@@ -1111,6 +1173,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1125,6 +1189,9 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
 
+    // phone-held KV: split vs unsplit attention (see llm_graph_input_attn_kv::can_reuse)
+    res &= inp_attn->remote_split == (params.ubatch.n_tokens > 8 && mctx->get_attn()->remote_tag_any() && mctx->get_attn()->remote_big());
+
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
     res &= inp_rs->s_copy_main->ne[0]  == params.ubatch.n_seqs;
@@ -1132,6 +1199,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1155,6 +1224,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
@@ -1175,6 +1246,8 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1229,6 +1302,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_input_replay(mctx->get_recr());
 }
 
 bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params) {
@@ -1264,6 +1339,8 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
 
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
+
     return res;
 }
 
@@ -1275,6 +1352,13 @@ void llm_graph_input_sampling::set_input(const llama_ubatch * ubatch) {
             llama_seq_id seq_id = ubatch->seq_id[i][0];
             active_samplers.insert(seq_id);
         }
+    }
+
+    if (batched_argmax) {
+        for (auto * smpl : batched_bias) {
+            smpl->iface->backend_set_input(smpl);
+        }
+        return;
     }
 
     for (auto seq_id : active_samplers) {
@@ -1374,8 +1458,15 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
+        const int32_t il_s = params.cparams.layer_start;
+        const int32_t il_e = params.cparams.layer_end;   // < 0: all layers
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
             if (embeddings_layer_inp[il]) {
+                // split prefill: a tap outside the layers this graph runs is produced elsewhere (the phone), not here
+                const bool in_range = (int32_t) il >= il_s && (il_e < 0 || (int32_t) il <= il_e);
+                if (!in_range && t_layer_inp[il] == nullptr) {
+                    continue;
+                }
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }
@@ -2380,10 +2471,14 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     {
         auto & cur = inps[0];
 
-        cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        // no tok_embd: a head-less split tail that only ever gets residual (embd) input
+        cur = tok_embd ? ggml_get_rows(ctx0, tok_embd, inp->tokens) : inp->embd;
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {
+            if (!tok_embd) {
+                break;
+            }
             llama_adapter_lora_weight * lw = lora.first->get_weight(tok_embd);
             if (lw == nullptr) {
                 continue;
@@ -2884,7 +2979,55 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = nullptr;
+
+    // phone-held KV (infernet): tag the attention op so the Metal backend adds the phone's partial for this layer.
+    // Only the 8-token GQA verify path can merge that partial. A bigger ubatch (prefill) with keys on a v3 phone is split
+    // here into 8-token attention ops: group 0 sends the whole ubatch to the phone in one ATTN_BIG call (op_params[6] =
+    // group, [7] = ubatch tokens), the other groups read their rows of its result, and the matmuls keep the full ubatch.
+    const int32_t rtag  = mctx_cur->remote_tag(il);
+    const int64_t n_tok = q->ne[2];
+    const bool    split = rtag != 0 && n_tok > 8 && n_tok <= 512 && mctx_cur->remote_big() && kq_mask->ne[2] == 1 && kq_mask->ne[3] == 1;
+    inp->remote_split = split;
+    if (split) {
+        std::vector<ggml_tensor *> parts;
+        for (int64_t t0 = 0, g = 0; t0 < n_tok; t0 += 8, ++g) {
+            const int64_t nt = std::min<int64_t>(8, n_tok - t0);
+            ggml_tensor * qg = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], nt, q->nb[1], q->nb[2], t0*q->nb[2]);
+            ggml_tensor * mg = ggml_view_4d(ctx0, kq_mask, kq_mask->ne[0], nt, 1, 1, kq_mask->nb[1], kq_mask->nb[2], kq_mask->nb[3],
+                                            t0*kq_mask->nb[1]);
+            ggml_tensor * cg = build_attn_mha(qg, k, v, kq_b, mg, sinks, v_mla, 0, kq_scale, il);
+            ggml_tensor * fa = cg->op == GGML_OP_FLASH_ATTN_EXT ? cg : cg->src[0];
+            GGML_ASSERT(fa && fa->op == GGML_OP_FLASH_ATTN_EXT && "phone-held KV needs flash attention");
+            ((int32_t *) fa->op_params)[5] = rtag;              // GGML_METAL_REMOTE_OP_PARAM
+            ((int32_t *) fa->op_params)[6] = (int32_t) g;
+            ((int32_t *) fa->op_params)[7] = (int32_t) n_tok;
+            ((int32_t *) fa->op_params)[8] = remote_half >= 0 ? remote_half + 1 : 0;   // pipelined ubatch half (0: plain)
+            // into the graph now, in group order: the Metal backend defers every group's merge to the last group (the phone's
+            // call overlaps the Mac's attention for all groups); the join below would otherwise be ordered between groups
+            ggml_build_forward_expand(gf, cg);
+            parts.push_back(cg);
+        }
+        // join the groups back along the token dimension (a balanced tree: log2(groups) copies of the output)
+        while (parts.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < parts.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, parts[i], parts[i + 1], 1));
+            }
+            if (parts.size() % 2) {
+                next.push_back(parts.back());
+            }
+            parts.swap(next);
+        }
+        cur = parts[0];
+    } else {
+        cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+        if (rtag != 0) {
+            ggml_tensor * fa = cur->op == GGML_OP_FLASH_ATTN_EXT ? cur : cur->src[0];
+            GGML_ASSERT(fa && fa->op == GGML_OP_FLASH_ATTN_EXT && "phone-held KV needs flash attention");
+            ((int32_t *) fa->op_params)[5] = rtag;   // GGML_METAL_REMOTE_OP_PARAM
+        }
+    }
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {
@@ -3518,6 +3661,19 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    // infernet GDN replay rollback: gather indices (see llm_graph_input_rs::set_input_replay)
+    if (const int64_t R = mctx_cur->get_rp_cap(); R > 0) {
+        GGML_ASSERT(n_seqs == 1 && "GDN replay rollback supports one sequence per ubatch");
+        const int64_t N = ubatch.n_seq_tokens;
+        const int64_t W = 3; // conv window; qwen35 ssm_d_conv - 1, checked when the graph is built
+        inp->rp_idx_conv = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, W + R + N);
+        ggml_set_input(inp->rp_idx_conv);
+        ggml_set_name(inp->rp_idx_conv, "rp_idx_conv");
+        inp->rp_idx_gb = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, R + N);
+        ggml_set_input(inp->rp_idx_gb);
+        ggml_set_name(inp->rp_idx_gb, "rp_idx_gb");
+    }
+
     return inp;
 }
 
@@ -3770,6 +3926,7 @@ void llm_graph_context::build_sampling() const {
     outs[0] = res->t_logits;
 
     auto inp_sampling = std::make_unique<llm_graph_input_sampling>(samplers);
+    auto * inp_sampling_ptr = inp_sampling.get();
     res->add_input(std::move(inp_sampling));
 
     std::map<llama_seq_id, std::vector<uint32_t>> sampling_rows;
@@ -3787,6 +3944,107 @@ void llm_graph_context::build_sampling() const {
 
     // res->t_logits will contain logits for all tokens that want the logits calculated (logits=1 or output=1)
     GGML_ASSERT(res->t_logits != nullptr && "missing t_logits tensor");
+
+    // infernet: LLAMA_BATCHED_ARGMAX=1 - when every sampler is greedy-equivalent, one argmax over all output rows
+    // replaces the per-row sampler graphs (a speculative verify has 8 rows: 8 chains of top-k/softmax/... over n_vocab).
+    // Per row it outputs the token (sampled), the same token as the only candidate, and its logit (so the host's
+    // common_sampler sees the same 1-candidate array as the temp <= 0 backend path).
+    // (read per graph build, not cached: lets one process compare both paths across contexts)
+    const char * batched_argmax_env = getenv("LLAMA_BATCHED_ARGMAX");
+    if (batched_argmax_env != nullptr && atoi(batched_argmax_env) != 0 && n_rows > 0) {
+        bool all_greedy = true;
+        for (const auto & entry : samplers) {
+            all_greedy = all_greedy && llama_sampler_is_greedy_equiv(entry.second);
+        }
+        {
+            std::string chain_names;
+            for (const auto & entry : samplers) {
+                if (strcmp(llama_sampler_name(entry.second), "chain") != 0) {
+                    chain_names += std::string(" ") + llama_sampler_name(entry.second);
+                    continue;
+                }
+                const int n = llama_sampler_chain_n(entry.second);
+                for (int i = 0; i < n; ++i) {
+                    chain_names += std::string(" ") + llama_sampler_name(llama_sampler_chain_get(entry.second, i));
+                }
+            }
+            static std::set<std::string> batched_argmax_logged; // once per distinct (result, chain)
+            const std::string key = std::string(all_greedy ? "engaged" : "refused") + chain_names;
+            if (batched_argmax_logged.insert(key).second) {
+                LLAMA_LOG_WARN("%s: LLAMA_BATCHED_ARGMAX: %s (%u rows; chain:%s)\n", __func__,
+                        all_greedy ? "engaged" : "refused, a sampler is not greedy-equivalent", n_rows, chain_names.c_str());
+            }
+        }
+        // logit-bias members (e.g. the server's ignore_eos -inf on EOG tokens): same bias for every row, so only with one sequence
+        std::vector<llama_sampler *> bias_smpls;
+        if (all_greedy) {
+            for (const auto & entry : samplers) {
+                if (strcmp(llama_sampler_name(entry.second), "chain") != 0) {
+                    continue;
+                }
+                for (int i = 0; i < llama_sampler_chain_n(entry.second); ++i) {
+                    llama_sampler * s = llama_sampler_chain_get(entry.second, i);
+                    if (llama_sampler_is_logit_bias(s)) {
+                        bias_smpls.push_back(s);
+                    }
+                }
+            }
+            if (!bias_smpls.empty() && samplers.size() > 1) {
+                all_greedy = false; // per-sequence biases would need per-row bias vectors
+            }
+        }
+        if (all_greedy) {
+            inp_sampling_ptr->batched_argmax = true;
+
+            ggml_tensor * logits = res->t_logits; // [n_vocab, n_rows], contiguous
+            GGML_ASSERT(ggml_is_contiguous(logits) && logits->ne[1] == (int64_t) n_rows);
+
+            for (const auto & entry : samplers) { // drop input tensors of a previous graph (as the per-row path does)
+                if (entry.second->iface->backend_reset) {
+                    entry.second->iface->backend_reset(entry.second);
+                }
+            }
+            if (!bias_smpls.empty()) {
+                // each logit-bias sampler turns a zero [n_vocab] row into its bias vector; add it to every row (broadcast)
+                llama_sampler_data data = {};
+                data.logits = ggml_fill(ctx0, ggml_view_1d(ctx0, logits, logits->ne[0], 0), 0.0f);
+                for (auto * s : bias_smpls) {
+                    s->iface->backend_apply(s, ctx0, gf, &data);
+                }
+                logits = ggml_add(ctx0, logits, data.logits);
+                inp_sampling_ptr->batched_bias = bias_smpls;
+            }
+
+            ggml_tensor * amax = ggml_argmax(ctx0, logits); // [n_rows] i32
+            ggml_set_name(amax, "batched_argmax");
+            ggml_set_output(amax);
+            ggml_build_forward_expand(gf, amax);
+
+            // logit of the argmax per row: rows as [1, n_vocab, n_rows], indices as [1, n_rows]
+            ggml_tensor * lmax = ggml_get_rows(ctx0,
+                    ggml_reshape_3d(ctx0, logits, 1, logits->ne[0], n_rows),
+                    ggml_reshape_2d(ctx0, amax, 1, n_rows)); // [1, 1, n_rows] f32
+            ggml_set_name(lmax, "batched_argmax_logit");
+            ggml_set_output(lmax);
+            ggml_build_forward_expand(gf, lmax);
+
+            for (const auto & [seq_id, rows] : sampling_rows) {
+                if (samplers.find(seq_id) == samplers.end()) {
+                    continue;
+                }
+                for (uint32_t row : rows) {
+                    ggml_tensor * tok = ggml_view_1d(ctx0, amax, 1, row * ggml_element_size(amax));
+                    ggml_tensor * lgt = ggml_view_1d(ctx0, lmax, 1, row * ggml_element_size(lmax));
+                    ggml_build_forward_expand(gf, tok);
+                    ggml_build_forward_expand(gf, lgt);
+                    res->t_sampled[row]        = tok;
+                    res->t_candidates[row]     = tok;
+                    res->t_sampled_logits[row] = lgt;
+                }
+            }
+            return;
+        }
+    }
 
     // add a dummy row to keep the single-output graph static regardless of active samplers
     // multi-output graphs can still vary with the number of output rows

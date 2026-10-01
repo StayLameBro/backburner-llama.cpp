@@ -275,11 +275,37 @@ public:
     ggml_tensor * s_copy_main;   // I32 [n_seqs]
     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
 
+    // infernet GDN replay rollback (R = replay capacity, N = ubatch tokens, n_seqs == 1), nullptr when off:
+    //   the conv sequence gathered from [conv window (3) | log (R) | new (N)] and the g/beta sequence gathered
+    //   from [log (R) | zero row | new (N)]; the replay count c only changes these indices, not the graph
+    ggml_tensor * rp_idx_conv = nullptr; // I32 [3 + R + N]
+    ggml_tensor * rp_idx_gb   = nullptr; // I32 [R + N]
+
+    void set_input_replay(const llama_memory_recurrent_context * mctx_r) const;
+    bool can_reuse_replay(const llama_memory_recurrent_context * mctx_r, const llama_ubatch & ubatch) const;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+};
+
+// infernet pipelined prefill: the GDN replay gather indices of one ubatch half. The first half replays the cell's log as a
+// whole ubatch would; the second replays nothing (the first half committed: an eager commit logs nothing)
+class llm_graph_input_rp_half : public llm_graph_input_i {
+public:
+    llm_graph_input_rp_half(const llama_memory_recurrent_context * mctx, bool first) : mctx(mctx), first(first) {}
+    virtual ~llm_graph_input_rp_half() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return false; }
+
+    ggml_tensor * rp_idx_conv = nullptr; // I32 [W + R + N/2]
+    ggml_tensor * rp_idx_gb   = nullptr; // I32 [R + N/2]
+
+    const llama_memory_recurrent_context * mctx;
+    bool first;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -344,6 +370,8 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    bool remote_split = false; // infernet phone-held KV: the tagged attention of this graph is split into 8-token groups
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -752,6 +780,11 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    // infernet: the graph uses one batched argmax instead of the samplers' own graphs (no sampler inputs to set)
+    bool batched_argmax = false;
+    // logit-bias samplers applied inside the batched argmax graph (their inputs are still set)
+    std::vector<llama_sampler *> batched_bias;
 };
 
 //
@@ -868,6 +901,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        if (cparams.layer_start != other.cparams.layer_start ||
+            cparams.layer_end   != other.cparams.layer_end) {
             return false;
         }
 
@@ -1013,6 +1051,9 @@ struct llm_graph_context {
 
     const int64_t n_tokens;
     const int64_t n_outputs;
+
+    // infernet pipelined prefill (LLAMA_REMOTE_PIPE): this builder builds one half of the ubatch (0 or 1); -1 = the whole
+    int remote_half = -1;
     const int32_t n_ctx_orig; // yarn
 
     const enum llama_pooling_type pooling_type;

@@ -51,6 +51,9 @@ void ggml_graph_optimize(struct ggml_cgraph * gf);
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
+// infernet: iq4_xs at 2..GGML_METAL_MV_NC columns -> kernel_mul_mv_iq4_xs_f32_nc (0 = off)
+int  ggml_metal_mv_nc_max(void);
+bool ggml_metal_op_mul_mat_use_mv_nc(const struct ggml_tensor * op);
 
 #ifdef __cplusplus
 }

@@ -163,6 +163,36 @@ public:
     ggml_type type_k() const;
     ggml_type type_v() const;
 
+    //
+    // phone-held KV (infernet, docs/phone-kv-262k.md): positions [0, n_remote) of sequence 0 live on the phone, which
+    // computes their share of every attention op (merged by the Metal GQA verify path). v1: one sequence, one stream,
+    // flash attention, f16 or q8_0 K/V; decode batches of <= 8 tokens once the phone holds keys.
+    //
+
+    // connect to the phone-attn server at "host:port"; call before the first decode; returns 0 on success
+    int32_t remote_attach(const char * host_port);
+
+    // move the n oldest Mac-held positions of sequence 0 to the phone (n is rounded down to a multiple of 64) and free
+    // their Mac cells; returns the number of positions moved, or -1 on error
+    int32_t remote_evict(uint32_t n);
+
+    // positions held by the phone
+    uint32_t remote_n() const { return n_remote; }
+    bool     remote_on() const { return remote; }
+    // the phone takes a whole prefill ubatch per layer in one call (protocol v3, ATTN_BIG): the graph splits phone-held
+    // attention into 8-token groups instead of llama_decode clamping the ubatch to 8 tokens
+    bool     remote_big() const { return remote && remote_big_fn && remote_big_fn() != 0; }
+
+    // free Mac cells
+    uint32_t remote_n_free() const;
+
+    // move whole pages (LLAMA_KV_REMOTE_PAGE positions, default 4096) of the oldest Mac positions to the phone until at
+    // least n cells are free; the caller must have synchronized the backends; returns false if that is impossible
+    bool remote_make_room(uint32_t n);
+
+    // op_params tag for the attention op of model layer il (0 = not attached)
+    int32_t remote_tag(int32_t il) const;
+
     std::vector<uint32_t> get_layer_ids() const;
     ggml_tensor * get_k_storage(int32_t il) const;
 
@@ -313,6 +343,23 @@ private:
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
+    // phone-held KV (see remote_attach)
+    bool     remote   = false;
+    uint32_t n_remote = 0;
+    int  (*remote_append_fn)  (int, uint32_t, uint32_t, const void *, const void *) = nullptr;
+    int  (*remote_truncate_fn)(uint32_t) = nullptr;
+    int  (*remote_big_fn)(void) = nullptr;
+
+    // drop the phone's keys at and after position p (rounded down to 64); returns false if positions had to be lost
+    bool remote_truncate(llama_pos p);
+
+    // restore of a state bigger than the free Mac cells: the oldest rr_n_ph positions go straight to the phone.
+    // rr_route[i] for the i-th saved cell: index into the Mac cells restored (sinfo order), or -1 (phone, at rr_pos[i])
+    uint32_t             rr_n_ph = 0;
+    std::vector<int32_t> rr_route;
+    std::vector<int32_t> rr_pos;
+    bool remote_restore_data(llama_io_read_i & io, uint32_t cell_count, const slot_info & sinfo);
+
     size_t total_size() const;
 
     size_t size_k_bytes() const;
@@ -397,6 +444,13 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // phone-held KV: op_params tag for the attention op of layer il (0 = none)
+    int32_t remote_tag(int32_t il) const;
+    // phone-held KV: split this ubatch's tagged attention into 8-token groups (the phone takes the whole ubatch per call)
+    bool remote_big() const;
+    // phone-held KV attached (some layer is tagged)
+    bool remote_tag_any() const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

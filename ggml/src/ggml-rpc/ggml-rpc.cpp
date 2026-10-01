@@ -21,6 +21,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <thread>
 
 static const char * RPC_DEBUG = std::getenv("GGML_RPC_DEBUG");
@@ -2136,8 +2137,10 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     while (true) {
         auto client_socket = server_socket->accept();
         if (client_socket == nullptr) {
-            fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            // a transient failure (e.g. the phone's USB link dropping) must not stop the server for good
+            fprintf(stderr, "Failed to accept client connection, retrying\n");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
         }
         printf("Accepted client connection\n");
         fflush(stdout);

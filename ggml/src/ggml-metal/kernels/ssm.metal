@@ -4,6 +4,109 @@ constant bool FC_ssm_conv_silu [[function_constant(FC_SSM_CONV + 1)]];
 constant int  FC_ssm_conv_nc    [[function_constant(FC_SSM_CONV + 2)]];
 
 // ref: ggml.c:ggml_compute_forward_ssm_conv_f32
+// infernet: GGML_OP_GDN_REPLAY_PREP (ggml.h ggml_gdn_replay_prep). One thread per conv channel (and per (h, t) of g/beta).
+// The arithmetic is written exactly as the kernels it replaces (kernel_ssm_conv_f32_f32_batched_4 with silu, the binbcast
+// add/mul and the unary softplus/sigmoid), so the result is bit-identical to the unfused graph.
+kernel void kernel_gdn_replay_prep_f32(
+        constant ggml_metal_kargs_gdn_replay_prep & args,
+        device const float   * rrow,
+        device const char    * xnew,
+        device const char    * alpha,
+        device const char    * beta,
+        device const float   * dt,
+        device const float   * av,
+        device const char    * convk,
+        device const int32_t * idc,
+        device const int32_t * idg,
+        device       float   * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int C = args.C;
+    const int T = args.T;
+    const int W = args.W;
+    const int R = args.R;
+    const int H = args.H;
+
+    if ((int) gid < C) {
+        const int c = gid;
+
+        float col[GGML_METAL_GDN_PREP_MAX_COLS];
+        for (int j = 0; j < W + T; ++j) {
+            const int p = idc[j];
+            col[j] = p < W + R ? rrow[p*C + c] : ((device const float *) (xnew + (p - (W + R))*args.nb_x1))[c];
+        }
+
+        const float4 k4 = *((device const float4 *) (convk + c*args.nb_k1));
+
+        for (int t = 0; t < T; ++t) {
+            float sumf = 0.0f;
+            sumf += dot(float4(col[t], col[t + 1], col[t + 2], col[t + 3]), k4);
+            dst[t*C + c] = sumf/(1.0f + exp(-sumf));
+        }
+
+        device float * outw = dst + C*T + 2*H*T;
+        for (int j = 0; j < W; ++j) {
+            outw[j*C + c] = col[args.commit_at + j];
+        }
+    }
+
+    if ((int) gid < H*T) {
+        const int h = gid % H;
+        const int t = gid / H;
+        const int p = idg[t];
+
+        device float * outg = dst + C*T;
+        device float * outb = outg + H*T;
+
+        if (p < R + 1) {
+            device const float * g_log = rrow + (W + R)*C;
+            device const float * b_log = g_log + H*(R + 1);
+            outg[gid] = g_log[p*H + h];
+            outb[gid] = b_log[p*H + h];
+        } else {
+            const int n = p - (R + 1);
+            const float x  = ((device const float *) (alpha + n*args.nb_a1))[h] + dt[h];
+            const float sp = select(log(1 + exp(x)), x, x > 20);
+            outg[gid] = sp * av[h];
+            const float y  = ((device const float *) (beta + n*args.nb_b1))[h];
+            outb[gid] = 1 / (1 + exp(-y));
+        }
+    }
+}
+
+// infernet: GGML_OP_DFLASH_CONV (ggml.h ggml_dflash_conv). One thread per (channel, token). No FMA contraction, so each
+// product and sum rounds as in the unfused MUL / ADD kernels (bit-identical).
+kernel void kernel_dflash_conv_f32(
+        constant ggml_metal_kargs_dflash_conv & args,
+        device const char  * hidden,
+        device const char  * dynamic,
+        device const float * base,
+        device       char  * dst,
+        uint2 gid[[thread_position_in_grid]]) {
+#pragma clang fp contract(off)
+    const int c = gid.x;
+    const int t = gid.y;
+    if (c >= args.H || t >= args.T) {
+        return;
+    }
+
+    const int K     = args.K;
+    const int tb    = t % args.bs;
+    const int g     = c / args.gs;
+    const int n_grp = args.H / args.gs;
+
+    device const float * dy = (device const float *) (dynamic + (uint64_t) t*args.nb_d1);
+
+    float r = 0.0f;
+    for (int tap = 0; tap < K; ++tap) {
+        const float w = dy[g + n_grp*(tap + K*args.side)] + base[c + args.H*(tap + K*args.side)];
+        const float v = tb >= tap ? ((device const float *) (hidden + (uint64_t) (t - tap)*args.nb_h1))[c] : 0.0f;
+        const float term = w * v;
+        r = tap == 0 ? term : r + term;
+    }
+
+    ((device float *) (dst + (uint64_t) t*args.nb1))[c] = r;
+}
+
 kernel void kernel_ssm_conv_f32_f32(
         constant ggml_metal_kargs_ssm_conv & args,
         device const  void * src0,

@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                 uint32_t   n_rs_replay) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
         model,
@@ -61,7 +62,8 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_rs_seq,
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recr(il); }
-            : filter_recr
+            : filter_recr,
+        n_rs_replay
     )) {}
 
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
@@ -86,7 +88,8 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                GGML_UNUSED(n_rs_seq);
+                ubatch = balloc.split_equal(n_ubatch, !unified, mem_recr->n_keep_tail(n_ubatch));
             }
 
             if (ubatch.n_tokens == 0) {
@@ -188,17 +191,23 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid::memory_breakdo
 }
 
 void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const auto & f = llama_state_filter_cur();
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && f.kv) {
         mem_attn->state_write(io, seq_id, flags);
     }
-    mem_recr->state_write(io, seq_id, flags);
+    if (f.rs) {
+        mem_recr->state_write(io, seq_id, flags);
+    }
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const auto & f = llama_state_filter_cur();
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0 && f.kv) {
         mem_attn->state_read(io, seq_id, flags);
     }
-    mem_recr->state_read(io, seq_id, flags);
+    if (f.rs) {
+        mem_recr->state_read(io, seq_id, flags);
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

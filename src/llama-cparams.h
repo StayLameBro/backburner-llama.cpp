@@ -7,6 +7,13 @@
 
 #define LLAMA_MAX_SEQ 256
 
+struct llama_ffn_offload_slot {
+    bool  (*fn)(float * y, const float * x, int32_t n_embd, int32_t n_tokens, int32_t il, void * user) = nullptr;
+    void *  user   = nullptr;
+    int32_t il     = 0;
+    bool *  failed = nullptr;
+};
+
 struct llama_cparams {
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
@@ -14,12 +21,24 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    uint32_t n_rs_replay = 0; // infernet: GDN replay rollback capacity R (0 = off; n_rs_seq is then 0)
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
     int32_t  n_threads_batch; // number of threads to use for batch processing
 
     int32_t  nextn_layer_offset = 0;
+
+    // split prefill: run only decoder layers [layer_start, layer_end) (layer_end < 0 -> n_layer)
+    // layer_start > 0 expects embd input (the residual stream entering layer_start);
+    // layer_end < n_layer skips the output norm + lm_head (read the residual via embeddings_layer_inp[layer_end])
+    int32_t  layer_start = 0;
+    int32_t  layer_end   = -1;
+
+    // FFN offload (llama_set_ffn_offload): layers [ffn_off_il0, ffn_off_il1) call slots[il] instead of the FFN matmuls
+    int32_t  ffn_off_il0 = 0;
+    int32_t  ffn_off_il1 = 0;
+    struct llama_ffn_offload_slot * ffn_off_slots = nullptr;   // [n_layer], owned by llama_context
 
     float rope_freq_base;
     float rope_freq_scale;

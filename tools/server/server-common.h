@@ -362,6 +362,14 @@ struct server_slot_stats {
     uint64_t n_draft_accepted    = 0;
     uint64_t n_draft_verif_steps = 0;
 
+    // depth-bench: wall time of the generation-phase pieces (us), summed over the request
+    int64_t  t_spec_draft_us   = 0; // common_speculative_draft()
+    int64_t  t_spec_process_us = 0; // common_speculative_process() (DFlash feature injection)
+    int64_t  t_tgt_decode_us   = 0; // target llama_decode + sync of generation batches (verify rounds)
+    uint64_t n_tgt_decode      = 0;
+    uint64_t n_spec_draft      = 0;
+    json     spec_impls;               // depth-bench: per-drafter counters for this request
+
     // these are absolute timestamps (in us)
     // note: must be signed - they are subtracted before the later ones are set
     int64_t t_start       = 0;

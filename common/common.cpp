@@ -1309,6 +1309,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
         cparams_dft.n_rs_seq = 0;
+        cparams_dft.n_rs_replay = 0;
 
         const common_fit_extra_model extra = {
             /*.path_model   =*/ params_dft.model.path.c_str(),
@@ -1721,6 +1722,8 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_rs_replay       = params.speculative.gdn_replay > 0 ?
+                                std::max<uint32_t>(params.speculative.gdn_replay, cparams.n_rs_seq + 1) : 0;
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

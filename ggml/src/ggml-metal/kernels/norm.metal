@@ -170,6 +170,15 @@ kernel void kernel_rms_norm_fuse_impl(
         if (F == 3) {
             y[i00] = (x[i00]*scale)*f0[i00] + f1[i00];
         }
+        if (F == 4) {
+            // infernet GGML_METAL_FUSION_NORM_GATE: (norm*w) * silu(z), silu as in kernel_unary (OP_UNARY_NUM_SILU); no
+            // reassociation (the library builds with fast math), so the result matches RMS_NORM + MUL, UNARY, MUL bit for bit
+#pragma clang fp reassociate(off)
+            const T z = f1[i00];
+            const T n = (x[i00]*scale)*f0[i00];
+            const T g = z / (1 + exp(-z));
+            y[i00] = n * g;
+        }
     }
 }
 
@@ -182,6 +191,63 @@ template [[host_name("kernel_rms_norm_mul_add_f32")]] kernel kernel_rms_norm_fus
 template [[host_name("kernel_rms_norm_f32_4")]]         kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 1>;
 template [[host_name("kernel_rms_norm_mul_f32_4")]]     kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 2>;
 template [[host_name("kernel_rms_norm_mul_add_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 3>;
+template [[host_name("kernel_rms_norm_mul_silu_mul_f32_4")]] kernel kernel_rms_norm_fuse_t kernel_rms_norm_fuse_impl<float4, 4>;
+
+// infernet: ADD + RMS_NORM + MUL (GGML_METAL_FUSION_ADD_NORM_MUL). One threadgroup per row: x = a + b is written, then
+// y = (x*scale)*w with the loop split, reduction and arithmetic of kernel_rms_norm_mul_f32_4 (same nth), so the result is
+// bit-identical to the unfused ADD then RMS_NORM + MUL. x is read back from its output (it may alias a or b).
+kernel void kernel_add_rms_norm_mul_f32_4(
+        constant ggml_metal_kargs_add_norm & args,
+        device const char * a,
+        device const char * b,
+        device const char * w,
+        device       char * xo,
+        device       char * yo,
+        threadgroup float * shmem_f32 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort3 tpitg[[thread_position_in_threadgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort3   ntg[[threads_per_threadgroup]]) {
+    if (sgitg == 0) {
+        shmem_f32[tiisg] = 0.0f;
+    }
+
+    const int i01 = tgpig.x;
+
+    device const float4 * a4 = (device const float4 *) (a  + i01*args.nb_a1);
+    device const float4 * b4 = (device const float4 *) (b  + i01*args.nb_b1);
+    device       float4 * x4 = (device       float4 *) (xo + i01*args.nb_x1);
+    device const float4 * w4 = (device const float4 *) w;
+
+    float sumf = 0.0f;
+
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        const float4 x = a4[i00] + b4[i00];
+        x4[i00] = x;
+        sumf += dot(x, x);
+    }
+    sumf = simd_sum(sumf);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tiisg == 0) {
+        shmem_f32[sgitg] = sumf;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    sumf = shmem_f32[tiisg];
+    sumf = simd_sum(sumf);
+
+    const float mean  = sumf/args.ne00;
+    const float scale = 1.0f/sqrt(mean + args.eps);
+
+    device float4 * y4 = (device float4 *) (yo + i01*args.nb_y1);
+    for (int i00 = tpitg.x; i00 < args.ne00_t; i00 += ntg.x) {
+        y4[i00] = (x4[i00]*scale)*w4[i00];
+    }
+}
 
 template <typename T0, typename T>
 kernel void kernel_l2_norm_impl(

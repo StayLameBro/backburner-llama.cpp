@@ -8,6 +8,7 @@
 #include "ggml-metal-context.h"
 #include "ggml-metal-ops.h"
 #include "ggml-metal-tuning.h"
+#include "ggml-metal-remote.h"
 
 #include <mutex>
 #include <string>
@@ -954,6 +955,22 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_tuning_fa_vec_baseline_ne") == 0) {
         return (void *)ggml_backend_metal_tuning_fa_vec_baseline_ne;
+    }
+    // infernet phone-held KV (ggml-metal-remote.h)
+    if (strcmp(name, "ggml_backend_metal_remote_attach") == 0) {
+        return (void *)ggml_backend_metal_remote_attach;
+    }
+    if (strcmp(name, "ggml_backend_metal_remote_append") == 0) {
+        return (void *)ggml_backend_metal_remote_append;
+    }
+    if (strcmp(name, "ggml_backend_metal_remote_truncate") == 0) {
+        return (void *)ggml_backend_metal_remote_truncate;
+    }
+    if (strcmp(name, "ggml_backend_metal_remote_held") == 0) {
+        return (void *)ggml_backend_metal_remote_held;
+    }
+    if (strcmp(name, "ggml_backend_metal_remote_big") == 0) {
+        return (void *) ggml_backend_metal_remote_big;
     }
     if (strcmp(name, "ggml_backend_metal_tuning_device_token") == 0) {
         return (void *)ggml_backend_metal_tuning_device_token;

@@ -413,6 +413,17 @@ static ggml_tensor * build_dflash2_conv(
     if (!ggml_is_contiguous(dynamic) || dynamic->ne[1] != n_tokens) {
         dynamic = ggml_cont_2d(ctx0, dynamic, dynamic->ne[0], n_tokens);
     }
+    // infernet round-cost: LLAMA_DFLASH_CONV_FUSE (default on) - the whole conv as one GGML_OP_DFLASH_CONV (same arithmetic,
+    // same rounding) instead of ~10 small launches, most of them a barrier level of their own. =0 builds the op chain below.
+    // The op is new (id appended after GDN_REPLAY_PREP): a phone-side RPC drafter (PHONE_DRAFT) built without it needs =0.
+    static const bool conv_fuse = [] {
+        const char * e = getenv("LLAMA_DFLASH_CONV_FUSE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (conv_fuse && hidden->ne[2] == 1 && hidden->ne[3] == 1 && base->ne[1] == kernel_size && ggml_is_contiguous(base)) {
+        return ggml_dflash_conv(ctx0, hidden, dynamic, base, side, block_size, group_size);
+    }
+
     ggml_tensor * blocks = ggml_reshape_3d(ctx0, hidden, hidden_size, block_size, n_blocks);
     ggml_tensor * coeffs = ggml_reshape_4d(ctx0, dynamic, n_groups, kernel_size, 2, n_tokens);
     ggml_tensor * coeffs_side = ggml_view_3d(ctx0, coeffs, n_groups, kernel_size, n_tokens,
@@ -476,7 +487,9 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
 
     const int64_t tokens_per_block = n_tokens / n_blocks;
     const int64_t block_size = std::min<int64_t>(tokens_per_block, hparams.dflash_block_size);
-    const int64_t row_used   = top_k + top_k * top_k;
+    // infernet: the row also carries the selector's inputs after the lattice (unary logits, then the rank-dim gate), for
+    // offline calibration of the selector (LLAMA_SELECTOR_CAPTURE); the CPU walk reads only the first top_k + top_k^2 floats
+    const int64_t row_used   = top_k + top_k * top_k + top_k + rank;
 
     ggml_tensor * candidates  = ggml_top_k(ctx0, res->t_logits, top_k);
     ggml_tensor * logits_rows = ggml_reshape_3d(ctx0, res->t_logits, 1, res->t_logits->ne[0], n_tokens);
@@ -521,6 +534,8 @@ static void build_dflash2_selector(llm_graph_context & g, const llama_model & mo
         ggml_tensor * row = ggml_concat(ctx0,
                 ggml_cast(ctx0, cand_run, GGML_TYPE_F32),
                 ggml_reshape_3d(ctx0, score, top_k * top_k, n_pos, n_blocks), 0);
+        row = ggml_concat(ctx0, row, unary_run, 0);
+        row = ggml_concat(ctx0, row, gate_run, 0);
         return ggml_pad(ctx0, row, n_embd - row_used, 0, 0, 0);
     };
 

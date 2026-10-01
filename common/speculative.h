@@ -2,6 +2,7 @@
 
 #include "llama.h"
 #include "common.h"
+#include "sampling.h"
 
 struct common_speculative;
 
@@ -34,6 +35,13 @@ std::vector<double> common_speculative_synth_rates_resolve(const common_params_s
 
 // return the conditional synthetic acceptance probabilities
 const std::vector<double> & common_speculative_get_synth_probs(const common_speculative * spec);
+
+// infernet speculative sampling: when on (LLAMA_SPEC_SAMPLE=1 and the target request samples stochastically), DFlash2 samples its
+// drafts from its selector distribution instead of taking the argmax, and records that distribution per draft position.
+// The verify then uses common_sampler_sample_and_accept_n_spec. Empty entries = deterministic drafts (n-gram, greedy).
+bool common_speculative_sample_enabled();
+void common_speculative_set_stochastic(common_speculative * spec, bool stochastic);
+const std::vector<struct common_draft_dist> & common_speculative_get_draft_dists(const common_speculative * spec, llama_seq_id seq_id);
 
 common_params common_base_params_to_speculative(const common_params & params);
 
@@ -91,6 +99,19 @@ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// depth-bench: per-implementation counters (which drafter fired, how much of it was accepted)
+struct common_speculative_impl_stats {
+    std::string type;
+    size_t  n_call_draft = 0; // times asked to draft
+    size_t  n_gen_drafts = 0; // rounds in which this impl supplied the draft
+    size_t  n_gen_tokens = 0;
+    size_t  n_acc_drafts = 0; // of those, rounds with >= 1 accepted token
+    size_t  n_acc_tokens = 0;
+    int64_t t_draft_us   = 0;
+};
+std::vector<common_speculative_impl_stats> common_speculative_get_impl_stats(const common_speculative * spec);
+void common_speculative_reset_impl_stats(common_speculative * spec);
 
 struct common_speculative_deleter {
     void operator()(common_speculative * s) { common_speculative_free(s); }

@@ -99,6 +99,18 @@ json server_slot_stats::to_json() const {
     if (n_draft_tokens > 0) {
         base["draft_n"]          = n_draft_tokens;
         base["draft_n_accepted"] = n_draft_accepted;
+        base["draft_verif_steps"] = n_draft_verif_steps;
+    }
+
+    if (n_tgt_decode > 0) {
+        base["t_spec_draft_ms"]   = t_spec_draft_us   / 1000.0;
+        base["t_spec_process_ms"] = t_spec_process_us / 1000.0;
+        base["t_tgt_decode_ms"]   = t_tgt_decode_us   / 1000.0;
+        base["n_tgt_decode"]      = n_tgt_decode;
+        base["n_spec_draft"]      = n_spec_draft;
+    }
+    if (!spec_impls.is_null()) {
+        base["spec_impls"] = spec_impls;
     }
 
     return base;

@@ -106,6 +106,8 @@ add_library(${TARGET}
     sampling.cpp
     sampling.h
     speculative.cpp
+    infernet-toggles.cpp
+    infernet-toggles.h
     speculative.h
     subproc.cpp
     subproc.h

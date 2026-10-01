@@ -16,6 +16,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * s,
         device       char * dst,
         device       char * dst_fuse,
+        device const int32_t * s_ids,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
@@ -37,8 +38,12 @@ kernel void kernel_gated_delta_net_impl(
 
     // input state layout [S_v, S_v, H, n_seqs] (s0 only): per-seq stride is H*D.
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
+    // s_rows (ggml_gated_delta_net_replay_rows): s0 is read straight from cache row s_ids[i23]; the output may be that
+    // same row (GDN_CACHE fusion): each thread reads the values it later overwrites before writing any of them
     const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
-    device const float * s_ptr = (device const float *) (s) + state_in_base;
+    device const float * s_ptr = args.s_rows
+        ? (device const float *) (s + (uint64_t) s_ids[i23]*args.nb_s1) + (i21*S_v*S_v + i20*S_v)
+        : (device const float *) (s) + state_in_base;
 
     float ls[NSG];
 
@@ -47,7 +52,14 @@ kernel void kernel_gated_delta_net_impl(
         ls[j] = s_ptr[is];
     }
 
-    device float * dst_attn = (device float *) (dst) + (i23*args.ne22*args.ne21 + i21)*S_v + i20;
+    // infernet replay mode (args.replay, K == 1): the first n_replay tokens only update the state (no attention row),
+    // a replay token with beta == 0 and g == 0 is an identity pad and is skipped (uniform per threadgroup: per head),
+    // and the one state written out is the one after commit_at tokens
+    const bool replay = args.replay != 0;
+    const int  n_rp   = args.n_replay;
+    const int  n_out  = args.ne22 - n_rp; // attention rows per (seq, head)
+
+    device float * dst_attn = (device float *) (dst) + (i23*n_out*args.ne21 + i21)*S_v + i20;
 
     device const float * q_ptr = (device const float *) (q + i23*args.nb03 + i01*args.nb01);
     device const float * k_ptr = (device const float *) (k + i23*args.nb13 + i11*args.nb11);
@@ -56,11 +68,37 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
+    // args.l2 with up to 32 tokens: the per-token norm scales of q and k are computed up front (they do not depend on the
+    // recurrence), one token per simdgroup at a time, so they stay off the sequential token loop
+    threadgroup float l2s[64]; // [t]: k scale, [32 + t]: q scale
+    const bool l2_pre = NSG == 4 && args.l2 && args.ne22 <= 32;
+    if (l2_pre) {
+        for (int t = ty; t < args.ne22; t += NSG) {
+            const float4 k4 = *((device const float4 *) (k_ptr + t*args.ns12) + tx);
+            const float4 q4 = *((device const float4 *) (q_ptr + t*args.ns02) + tx);
+
+            float sk = 0.0f;
+            sk += dot(k4, k4);
+            sk = simd_sum(sk);
+            float sq = 0.0f;
+            sq += dot(q4, q4);
+            sq = simd_sum(sq);
+
+            if (tx == 0) {
+                const float mean_k = sk/args.l2_n;
+                const float mean_q = sq/args.l2_n;
+                l2s[t]      = 1.0f/sqrt(mean_k + args.l2_eps);
+                l2s[32 + t] = 1.0f/sqrt(mean_q + args.l2_eps);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K, only slots 0..n_tokens-1 are written; older slots are caller-owned.
 
     // output state base offset: after attention scores
-    const uint attn_size = args.ne22 * args.ne21 * S_v * args.ne23;
+    const uint attn_size = n_out * args.ne21 * S_v * args.ne23;
     // output state per-slot size: S_v * S_v * H * n_seqs
     const uint state_size_per_snap = S_v * S_v * args.ne21 * args.ne23;
     // per-(seq,head) offset within a slot
@@ -72,17 +110,72 @@ kernel void kernel_gated_delta_net_impl(
     const device float * state_out = fused ? (device float *)dst_fuse : (device float *)dst + attn_size;
     const uint slot_stride = fused ? (uint)args.nb_out : state_size_per_snap;
 
+    device float * dst_commit = (device float *)state_out + state_out_base; // replay mode: the one state (slot 0)
+
+    if (replay && args.commit_at == 0) {
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            dst_commit[tx*NSG + j] = ls[j];
+        }
+    }
+
     for (short t = 0; t < args.ne22; t++) {
+        const bool rp = t < n_rp;
+
+        if (!(rp && G == 1 && b_ptr[0] == 0.0f && g_ptr[0] == 0.0f)) {
+        // this lane's NSG elements of the q and k rows (L2-normalized here when args.l2)
+        float kr[NSG];
+        float qr[NSG];
+
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            kr[j] = k_ptr[tx*NSG + j];
+            qr[j] = q_ptr[tx*NSG + j];
+        }
+
+        if (NSG == 4 && args.l2) {
+            const float4 k4 = float4(kr[0], kr[1], kr[2], kr[3]);
+            const float4 q4 = float4(qr[0], qr[1], qr[2], qr[3]);
+
+            float scale_k;
+            float scale_q;
+
+            if (l2_pre) {
+                scale_k = l2s[t];
+                scale_q = l2s[32 + t];
+            } else {
+            // exactly kernel_rms_norm_mul_f32_4 with use_scale at 128 wide (32 threads, one float4 each, simd_sum; the second
+            // reduction over the zero-initialized shared slots adds only zeros), then * 1/sqrt(128): bit-identical to the
+            // unfused RMS_NORM + SCALE of build_gdn_l2_norm (same expressions, same fast-math flags)
+            float sk = 0.0f;
+            sk += dot(k4, k4);
+            sk = simd_sum(sk);
+            float sq = 0.0f;
+            sq += dot(q4, q4);
+            sq = simd_sum(sq);
+
+            const float mean_k  = sk/args.l2_n;
+            scale_k = 1.0f/sqrt(mean_k + args.l2_eps);
+            const float mean_q  = sq/args.l2_n;
+            scale_q = 1.0f/sqrt(mean_q + args.l2_eps);
+            }
+
+            const float4 kn = (k4*scale_k)*args.l2_scale;
+            const float4 qn = (q4*scale_q)*args.l2_scale;
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                kr[j] = kn[j];
+                qr[j] = qn[j];
+            }
+        }
+
         float s_k = 0.0f;
 
         if (G == 1) {
             const float g_exp = exp(g_ptr[0]);
 
             FOR_UNROLL (short j = 0; j < NSG; j++) {
-                const short is = tx*NSG + j;
                 ls[j] *= g_exp;
 
-                s_k += ls[j]*k_ptr[is];
+                s_k += ls[j]*kr[j];
             }
         } else {
             // KDA
@@ -90,7 +183,7 @@ kernel void kernel_gated_delta_net_impl(
                 const short is = tx*NSG + j;
                 ls[j] *= exp(g_ptr[is]);
 
-                s_k += ls[j]*k_ptr[is];
+                s_k += ls[j]*kr[j];
             }
         }
 
@@ -101,17 +194,19 @@ kernel void kernel_gated_delta_net_impl(
         float y = 0.0f;
 
         FOR_UNROLL (short j = 0; j < NSG; j++) {
-            const short is = tx*NSG + j;
-            ls[j] += k_ptr[is]*d;
+            ls[j] += kr[j]*d;
 
-            y += ls[j]*q_ptr[is];
+            y += ls[j]*qr[j];
         }
 
-        y = simd_sum(y);
+        if (!rp) {
+            y = simd_sum(y);
 
-        if (tx == 0) {
-            dst_attn[t*args.ne21*S_v] = y*scale;
+            if (tx == 0) {
+                dst_attn[(t - n_rp)*args.ne21*S_v] = y*scale;
+            }
         }
+        } // !pad
 
         q_ptr += args.ns02;
         k_ptr += args.ns12;
@@ -119,6 +214,12 @@ kernel void kernel_gated_delta_net_impl(
 
         b_ptr += args.ne21;
         g_ptr += args.ne21*G;
+
+        if (replay && t + 1 == args.commit_at) {
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                dst_commit[tx*NSG + j] = ls[j];
+            }
+        }
 
         if (K > 1) {
             const int target_slot = (int)args.ne22 - 1 - (int)t;
@@ -132,7 +233,7 @@ kernel void kernel_gated_delta_net_impl(
         }
     }
 
-    if (K == 1) {
+    if (K == 1 && !replay) {
         device float * dst_state = (device float *)state_out + state_out_base;
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
@@ -166,6 +267,7 @@ kernel void kernel_gated_delta_net_impl(
         device const char * s,
         device       char * dst,
         device       char * dst_fuse,
+        device const int32_t * s_ids,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {

@@ -119,6 +119,8 @@
 #define FC_NORM                        1700
 #define FC_TOPK_MOE                    1800
 #define FC_MOE_REDUCE                  1900
+#define FC_MUL_MM_RF                   2000 // infernet: regfed split-K variant
+#define FC_FA_GQA_ABL                  2100 // infernet: FA_GQA timing ablations
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -489,6 +491,71 @@ typedef struct {
     int32_t  nrows;
 } ggml_metal_kargs_flash_attn_ext_vec_reduce;
 
+// infernet SME co-attention: copy the CPU's partial (its own shared buffer) into slot iwg of the split-K partials
+typedef struct {
+    int32_t nrows;
+    int32_t nwg;     // partial slots per row
+    int32_t iwg;     // the CPU's slot
+    int32_t src_sm;  // offset (floats) of the CPU's (S, M) pairs in its buffer
+    int32_t row0;    // first source row (phone ATTN_BIG buffer: the 8-token group's rows); 0 otherwise
+} ggml_metal_kargs_flash_attn_ext_coattn_scatter;
+
+// GQA verify flash attention (GGML_METAL_FA_GQA): one threadgroup per (KV split, KV head, seq),
+// the G*ne01 (query head, query token) rows of the GQA group as 8-row simdgroup fragments.
+typedef struct {
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne03;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb03;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb13;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb23;
+    int32_t  ne30;
+    int32_t  ne32;
+    int32_t  ne33;
+    uint64_t nb31;
+    uint64_t nb32;
+    uint64_t nb33;
+    int32_t  ne1;
+    int32_t  ne2;
+    int32_t  ne3;
+    float    scale;
+    int32_t  nwg;
+    int32_t  has_mask;
+    int32_t  ntok;    // query tokens per threadgroup (verify: ne01; prefill: GGML_METAL_FA_PREFILL_GQA tile)
+    int32_t  use_blk; // 1: blk[] (kernel_flash_attn_ext_blk at nqptg = ntok, ncpsg = C) skips masked chunks
+    int32_t  nwg_out; // partial slots per row in dst (0: = nwg). > nwg leaves slots nwg.. for other producers (SME co-attention)
+} ggml_metal_kargs_flash_attn_ext_gqa;
+
+// prefill flash attention on the GPU's matrix units (Metal 4 tensor ops, A19 / M5: GGML_METAL_FA_PREFILL_NA=1):
+// one threadgroup per (64-token tile, query head), K/V read as f16 straight from device memory
+typedef struct {
+    int32_t  ne01;    // query tokens
+    int32_t  ne02;    // query heads
+    int32_t  ne11;    // keys
+    int32_t  ne12;    // KV heads
+    uint64_t nb01;    // q: bytes per token row
+    uint64_t nb02;    // q: bytes per head
+    uint32_t nsk;     // K: halves between keys
+    uint32_t nhk;     // K: halves between KV heads
+    uint32_t nsv;     // V: halves between keys
+    uint32_t nhv;     // V: halves between KV heads
+    uint32_t nm1;     // mask: halves per token row
+    int32_t  ne30;    // mask: keys (blk[] columns)
+    uint32_t nd2;     // dst: floats per token (n_head*DV)
+    float    scale;
+    int32_t  has_mask;
+    int32_t  use_blk; // blk[] at (nqptg 64, ncpsg 64): 0 = skip the key block, 2 = no mask reads
+} ggml_metal_kargs_flash_attn_ext_pna;
+
 typedef struct {
     int32_t  ne00;
     int32_t  ne02;
@@ -504,7 +571,19 @@ typedef struct {
     int32_t  ne1;
     int16_t  r2;
     int16_t  r3;
+    int32_t  ldd;     // dst row stride in floats (= ne0 unless SME prefill takes the last rows, ggml-metal-mmsme.h)
 } ggml_metal_kargs_mul_mm;
+
+// register-fed MMA for short verify batches (kernel_mul_mm_rf, GGML_METAL_REGFED=1)
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    uint64_t nb01;
+    int32_t  ne11;
+    uint64_t nb11;
+    uint64_t nb1;
+    int32_t  ksplit;   // >1: the simdgroups of a threadgroup share one 32-row tile and split K (IQ4_XS, Q8_0)
+} ggml_metal_kargs_mul_mm_rf;
 
 typedef struct {
     int32_t  ne00;
@@ -627,6 +706,17 @@ typedef struct {
     uint64_t nbf3[3];
     float    scale;
 } ggml_metal_kargs_norm;
+
+// infernet: ADD + RMS_NORM + MUL (GGML_METAL_FUSION_ADD_NORM_MUL)
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne00_t;
+    uint64_t nb_a1;
+    uint64_t nb_b1;
+    uint64_t nb_x1;
+    uint64_t nb_y1;
+    float    eps;
+} ggml_metal_kargs_add_norm;
 
 typedef struct {
     int32_t  ne00;
@@ -925,6 +1015,36 @@ typedef struct {
     uint64_t nb2;
 } ggml_metal_kargs_ssm_conv;
 
+// infernet: GGML_OP_GDN_REPLAY_PREP
+#define GGML_METAL_GDN_PREP_MAX_COLS 48
+
+typedef struct {
+    int32_t  C;
+    int32_t  N;
+    int32_t  H;
+    int32_t  W;
+    int32_t  R;
+    int32_t  T;
+    int32_t  commit_at;
+    uint64_t nb_x1;
+    uint64_t nb_a1;
+    uint64_t nb_b1;
+    uint64_t nb_k1;
+} ggml_metal_kargs_gdn_replay_prep;
+
+// infernet: GGML_OP_DFLASH_CONV
+typedef struct {
+    int32_t  H;
+    int32_t  T;
+    int32_t  K;
+    int32_t  side;
+    int32_t  bs;
+    int32_t  gs;
+    uint64_t nb_h1;
+    uint64_t nb_d1;
+    uint64_t nb1;
+} ggml_metal_kargs_dflash_conv;
+
 typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
@@ -999,6 +1119,15 @@ typedef struct {
     uint64_t nb2;
     uint64_t nb3;
     uint64_t nb_out; // 0 => snapshots are appended after the attn scores (unfused)
+    int32_t  replay;    // infernet replay mode (op param 3): K == 1, no attn rows for the first n_replay tokens,
+    int32_t  n_replay;  //   state written after commit_at tokens, identity pads (beta == 0, g == 0) skipped
+    int32_t  commit_at;
+    int32_t  s_rows;    // ggml_gated_delta_net_replay_rows: s0 of seq s is row s_ids[s] of the cache (row stride nb_s1)
+    uint64_t nb_s1;
+    int32_t  l2;        // ggml_gated_delta_net_set_l2: q, k normalized on load (needs S_k == 128: one float4 per lane)
+    int32_t  l2_n;
+    float    l2_eps;
+    float    l2_scale;  // 1/sqrt(S_k)
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

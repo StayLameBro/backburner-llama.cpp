@@ -9,6 +9,33 @@
 
 struct llama_ubatch;
 
+// infernet: filter applied by the next state_write / state_read calls on this thread (split prefill, phone-held KV).
+// Inactive by default: every existing save/restore path is unchanged. Set via llama_state_filter_set() (llama-ext.h).
+//   write: KV cells only with pos in [p0, p1); KV and recurrent layers only with model layer id in [il0, il1)
+//          (the written layer count is the filtered count, so a split TAIL GGUF whose layers [0, il1-il0) are
+//          layers [il0, il1) of the full model reads it unchanged)
+//   read : the incoming layers go to layers [il0, il1) of this model; kv_mode / rs_mode say how cells are placed
+struct llama_state_filter {
+    enum mode_t : int32_t {
+        REPLACE   = 0, // default: the sequence is cleared, then the saved cells are placed
+        APPEND    = 1, // KV only: keep the sequence's cells, add the saved ones (positions must be new)
+        OVERWRITE = 2, // rows only: the cells already exist (same seq, same positions); only the filtered layers' rows are written
+    };
+    bool      active = false;
+    llama_pos p0 = 0, p1 = 0x7fffffff;
+    int32_t   il0 = 0, il1 = 0x7fffffff;
+    mode_t    kv_mode = REPLACE, rs_mode = REPLACE;
+    bool      kv = true, rs = true;    // hybrid memory: which part is written / read
+    // rs OVERWRITE after the cell already advanced (split prefill "head-first": the layers below the filter ran the next
+    // ubatch): write the filtered layers' rows only, keep the cell's pos / rp_c
+    bool      rs_keep_meta = false;
+
+    bool layer_in(int32_t il) const { return !active || (il >= il0 && il < il1); }
+    bool pos_in(llama_pos p) const  { return !active || (p >= p0 && p < p1); }
+};
+
+llama_state_filter & llama_state_filter_cur();
+
 class llama_batch_allocr;
 
 class llama_io_write_i;

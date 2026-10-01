@@ -1,3 +1,4 @@
+#include "infernet-toggles.h"
 #include "server-context.h"
 #include "server-chat.h"
 #include "server-common.h"
@@ -394,6 +395,7 @@ struct server_slot {
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
         n_accepted_per_pos.clear();
+        common_speculative_reset_impl_stats(spec); // depth-bench: per-request drafter counters (np=1)
 
         n_predict_max = -1;
 
@@ -681,6 +683,15 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+        // depth-bench: which drafter fired and how much of it the target accepted
+        for (const auto & st : common_speculative_get_impl_stats(spec)) {
+            SLT_INF(*this, "drafter %-14s: asked %4zu, fired %4zu (%5.1f%%), drafted %5zu, accepted %5zu (%5.1f%%), acc/fired %.2f, %.1f ms\n",
+                    st.type.c_str(), st.n_call_draft, st.n_gen_drafts,
+                    st.n_call_draft ? 100.0 * st.n_gen_drafts / st.n_call_draft : 0.0,
+                    st.n_gen_tokens, st.n_acc_tokens,
+                    st.n_gen_tokens ? 100.0 * st.n_acc_tokens / st.n_gen_tokens : 0.0,
+                    st.n_gen_drafts ? (double) st.n_acc_tokens / st.n_gen_drafts : 0.0, st.t_draft_us / 1000.0);
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -898,6 +909,7 @@ private:
     bool add_bos_token = true;
 
     int32_t n_ctx; // total context for all clients / slots
+    int32_t kv_remote_ctx = 0; // infernet: phone-held KV attached -> tokens a slot may hold (Mac cells + phone pages)
 
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
@@ -1114,6 +1126,23 @@ private:
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
+
+        // infernet: phone-held KV (docs/phone-kv-262k.md, llama.cpp ws/phone-kv). LLAMA_KV_REMOTE=host:port attaches the phone's
+        // attention service (Sidecar :50062, protocol v2) to the target's KV cache. -c is then the number of cells the MAC keeps:
+        // when they run out, llama_decode moves the oldest pages to the phone, so one slot holds up to LLAMA_KV_REMOTE_CTX tokens
+        // (default 262144). Whole-state saves are refused while the phone holds keys, so the RAM prompt cache is turned off;
+        // hybrid checkpoints stay on (they save only the recurrent state).
+        if (const char * kr = getenv("LLAMA_KV_REMOTE"); kr && *kr) {
+            if (llama_kv_remote_attach(ctx_tgt, kr) != 0) {
+                SRV_ERR("phone-held KV: cannot attach the phone at %s (Sidecar running? phone-attn on :50062?)\n", kr);
+                return false;
+            }
+            const char * kc = getenv("LLAMA_KV_REMOTE_CTX");
+            kv_remote_ctx = kc && atoi(kc) > 0 ? atoi(kc) : 262144;
+            params_base.cache_ram_mib = 0;
+            SRV_INF("phone-held KV: attached %s; the Mac keeps %d cells, a slot may hold %d tokens (older pages move to the phone)\n",
+                    kr, n_ctx, kv_remote_ctx);
+        }
 
         add_bos_token = llama_vocab_get_add_bos(vocab);
 
@@ -1804,7 +1833,7 @@ private:
             SLT_TRC(slot, "sampler chain: %s\n", common_sampler_print(slot.smpl.get()).c_str());
             SLT_TRC(slot, "sampler params: \n%s\n", task.params.sampling.print().c_str());
 
-            if (spec && !common_speculative_get_synth_probs(spec.get()).empty()) {
+            if (spec && (!common_speculative_get_synth_probs(spec.get()).empty() || common_speculative_sample_enabled())) {
                 const uint32_t seed = task.params.sampling.seed == LLAMA_DEFAULT_SEED
                     ? std::random_device{}()
                     : task.params.sampling.seed;
@@ -2108,6 +2137,15 @@ private:
             res->tokens      = std::move(slot.generated_tokens);
         }
         res->stats           = slot.stats;
+        if (slot.spec) {
+            json arr = json::array();
+            for (const auto & st : common_speculative_get_impl_stats(slot.spec)) {
+                arr.push_back({{"type", st.type}, {"n_call_draft", st.n_call_draft}, {"n_gen_drafts", st.n_gen_drafts},
+                               {"n_gen_tokens", st.n_gen_tokens}, {"n_acc_drafts", st.n_acc_drafts},
+                               {"n_acc_tokens", st.n_acc_tokens}, {"t_draft_ms", st.t_draft_us / 1000.0}});
+            }
+            res->stats.spec_impls = arr;
+        }
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
 
@@ -2579,6 +2617,13 @@ private:
                         break;
                     }
 
+                    // depth-bench: a feature-conditioned drafter (DFlash) keeps its own KV over the
+                    // prompt; save it next to the target state so a restore does not starve the drafter
+                    if (slot->ctx_dft) {
+                        const size_t nw_dft = llama_state_seq_save_file(slot->ctx_dft, (filepath + ".dft").c_str(), slot->id, nullptr, 0);
+                        SRV_INF("saved draft state: %zu bytes\n", nw_dft);
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2634,6 +2679,29 @@ private:
 
                         if (!restored.validate(ctx_tgt)) {
                             throw std::runtime_error("Invalid tokens in slot save file");
+                        }
+
+                        if (slot->ctx_dft) {
+                            const std::string fdft = filepath + ".dft";
+                            llama_memory_seq_rm(llama_get_memory(slot->ctx_dft), slot->id, -1, -1);
+                            if (FILE * f = fopen(fdft.c_str(), "rb")) {
+                                fclose(f);
+                                // infernet fix: with a null token buffer llama_state_seq_load_file only probes the header
+                                // (returns 12 bytes) and loads nothing, so every restore used to leave the drafter blind.
+                                // Probe for the token count, then load for real (as the target restore above does).
+                                size_t n_dft_tok = 0;
+                                size_t nr_dft = llama_state_seq_load_file(slot->ctx_dft, fdft.c_str(), slot->id, nullptr, 0, &n_dft_tok);
+                                if (nr_dft != 0) {
+                                    std::vector<llama_token> dft_tokens(std::max<size_t>(n_dft_tok, 1));
+                                    nr_dft = llama_state_seq_load_file(slot->ctx_dft, fdft.c_str(), slot->id, dft_tokens.data(), dft_tokens.size(), &n_dft_tok);
+                                }
+                                if (nr_dft == 0) {
+                                    throw std::runtime_error("failed to load draft state " + fdft);
+                                }
+                                SRV_INF("restored draft state: %zu bytes\n", nr_dft);
+                            } else {
+                                SRV_WRN("no draft state %s - drafter starts without the prompt context\n", fdft.c_str());
+                            }
                         }
 
                         slot->prompt.clear();
@@ -3025,9 +3093,51 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        int32_t n_cap = n_draft_max;
+                        // depth-bench: a draft longer than the target's recurrent rollback slots (n_rs_seq = draft n_max)
+                        // forces a full recurrent-state checkpoint (169 MiB) before the verify and a restore + replay
+                        // decode after a partial accept. n-gram drafters propose 8 (ngram-cache) or 48 (ngram-simple)
+                        // tokens, so cap every draft at n_rs_seq unless SPEC_NO_RS_CAP is set.
+                        static const bool no_rs_cap = getenv("SPEC_NO_RS_CAP") != nullptr;
+                        if (!no_rs_cap && ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && llama_n_rs_seq(ctx_tgt) > 0) {
+                            n_cap = std::min<int32_t>(n_cap, (int32_t) llama_n_rs_seq(ctx_tgt));
+                        }
+                        if (params_base.speculative.adapt_k && slot.stats.n_draft_verif_steps >= 4) {
+                            const double mean = (double) slot.stats.n_draft_accepted / (double) slot.stats.n_draft_verif_steps;
+                            if (mean < 3.5) {
+                                n_cap = std::min(n_cap, 4);
+                            }
+                        }
+
+                        // infernet: depth-aware verify width. At depth every verify row costs attention (FA_GQA packs 6 GQA heads x
+                        // tokens into 8-row MMA fragments: 143k keys, 5 rows 4.4 ms/layer vs 8 rows 6.9), while the last draft
+                        // positions are the least likely to be kept, so past some depth a shorter draft is faster per token
+                        // (docs/LEVER-MAP.md §6). LLAMA_SPEC_DEPTH_CAP=<kv>:<n> caps drafts at n once the slot holds >= kv
+                        // tokens (off by default); the runtime toggle LLAMA_SPEC_NMAX=<n> caps at every depth (benchmarks).
+                        {
+                            static const std::pair<int32_t, int32_t> depth_cap = [] {
+                                const char * e = getenv("LLAMA_SPEC_DEPTH_CAP");
+                                int kv = 0, n = 0;
+                                if (e && sscanf(e, "%d:%d", &kv, &n) == 2 && kv > 0 && n >= 1) {
+                                    return std::make_pair((int32_t) kv, (int32_t) n);
+                                }
+                                return std::make_pair((int32_t) 0, (int32_t) 0);
+                            }();
+                            const double nmax_t = infernet_toggle("LLAMA_SPEC_NMAX", 0.0);
+                            if (nmax_t >= 1.0) {
+                                n_cap = std::min<int32_t>(n_cap, (int32_t) nmax_t);
+                            } else if (depth_cap.first > 0 && slot.prompt.tokens.pos_next() >= depth_cap.first &&
+                                       !(getenv("LLAMA_SPEC_ADAPT") && atoi(getenv("LLAMA_SPEC_ADAPT")) > 0)) {   // the adaptive rule picks the length itself
+                                n_cap = std::min<int32_t>(n_cap, depth_cap.second);
+                            }
+                        }
+
+                        // infernet speculative sampling: stochastic requests get sampled drafts + the p/q verify
+                        common_speculative_set_stochastic(spec.get(), slot.task->params.sampling.temp > 0.0f);
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ n_cap,
                             /* .pos0     = */ slot.prompt.tokens.pos_next(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3042,9 +3152,15 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            const int64_t t0_draft = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            const int64_t dt_draft = ggml_time_us() - t0_draft;
+            for (auto * s : drafting) {
+                s->stats.t_spec_draft_us += dt_draft;
+                s->stats.n_spec_draft    += 1;
+            }
         }
 
         // make checkpoints if needed
@@ -3563,9 +3679,17 @@ private:
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+                            // split prefill (LLAMA_SPLIT_TAIL) needs >= 2 ubatches per batch to overlap with the phone: the
+                            // 4 + n_ubatch stop leaves the last ubatch alone and Mac-only. LLAMA_SPLIT_ONE_BATCH=1 keeps only
+                            // the 4-token checkpoint (a prompt that later diverges in its last ~n_ubatch tokens re-reads more).
+                            static const bool split_one_batch = getenv("LLAMA_SPLIT_TAIL") && getenv("LLAMA_SPLIT_ONE_BATCH") &&
+                                                                atoi(getenv("LLAMA_SPLIT_ONE_BATCH")) != 0;
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                if (split_one_batch && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3678,12 +3802,29 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        const int64_t t0_dec = ggml_time_us();
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        {
+            // depth-bench: attribute to slots that are purely generating (verify rounds / plain decode)
+            const int64_t dt_dec = ggml_time_us() - t0_dec;
+            bool any_prompt = false;
+            for (auto & s : slots) {
+                any_prompt |= s.is_processing() && s.state != SLOT_STATE_GENERATING;
+            }
+            if (!any_prompt) {
+                for (auto & s : slots) {
+                    if (s.state == SLOT_STATE_GENERATING) {
+                        s.stats.t_tgt_decode_us += dt_dec;
+                        s.stats.n_tgt_decode    += 1;
+                    }
+                }
+            }
+        }
 
         if (ret != 0) {
             {
@@ -3743,9 +3884,18 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             bool ok = true;
+            const int64_t t0_proc = ggml_time_us();
             queue_tasks.yield_to_queue([&]() {
                 ok = common_speculative_process(spec.get(), batch_view);
             });
+            {
+                const int64_t dt_proc = ggml_time_us() - t0_proc;
+                for (auto & s : slots) {
+                    if (s.state == SLOT_STATE_GENERATING) {
+                        s.stats.t_spec_process_us += dt_proc;
+                    }
+                }
+            }
 
             if (!ok) {
                 SRV_ERR("%s", "failed to process speculative batch\n");
@@ -3912,7 +4062,12 @@ private:
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                auto accepted = synth_probs.empty()
+                const bool spec_sample = synth_probs.empty() && common_speculative_sample_enabled() &&
+                                         slot.task->params.sampling.temp > 0.0f;
+                auto accepted = spec_sample
+                    ? common_sampler_sample_and_accept_n_spec(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            common_speculative_get_draft_dists(spec.get(), slot.id), slot.spec_synth_rng)
+                    : synth_probs.empty()
                     ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
                     : server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
@@ -4026,6 +4181,10 @@ private:
     // context size of a single slot, capped by --kv-unified-per-slot and by the training context of the model
     int n_ctx_slot() const {
         int res = llama_n_ctx_seq(ctx_tgt);
+
+        if (kv_remote_ctx > 0) {
+            res = kv_remote_ctx;   // infernet: the phone holds what doesn't fit in the Mac's cells
+        }
 
         if (params_base.kv_unified_per_slot > 0) {
             res = std::min(res, params_base.kv_unified_per_slot);

@@ -24,7 +24,8 @@ public:
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_rs_seq,
-        const layer_filter_cb & filter);
+        const layer_filter_cb & filter,
+                     uint32_t   n_rs_replay = 0);
 
     ~llama_memory_recurrent() = default;
 
@@ -78,6 +79,28 @@ public:
 
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
+    // infernet: GDN replay rollback (docs/replay-rollback.md), 0 = off
+    //   each cell keeps one committed state X (s row) and, in its r row (floats, C = conv channels, H = v heads):
+    //     [C x (3 + R)] token-major: rows 0..2 = the conv window before X, rows 3.. = log of the last ubatch's raw in-proj output
+    //     [H x (R + 1)] log of the gate g,  row R stays zero (identity pad)
+    //     [H x (R + 1)] log of beta,        row R stays zero (identity pad)
+    //   cell.rp_c = number of logged tokens that are committed, i.e. replayed at the start of the next ubatch
+    uint32_t n_rs_replay = 0;
+    uint32_t n_embd_r_row = 0; // floats per cell in r_l (n_embd_r(), or the replay layout above)
+
+    // an ubatch of at most R tokens per seq is "lazy": its state is committed at the next ubatch, so it can be rolled back
+    bool replay_lazy(uint32_t n_seq_tokens) const { return n_rs_replay > 0 && n_seq_tokens <= n_rs_replay; }
+
+    // [TAG_RECURRENT_ROLLBACK_SPLITS] trailing tokens of each seq that split_equal keeps in one ubatch: n_rs_seq + 1
+    // for the rollback slots; R for replay (the same value at the same rollback depth, so both modes split a batch
+    // into the same ubatches and compute the same numbers), unless n_ubatch is too small for that
+    uint32_t n_keep_tail(uint32_t n_ubatch) const {
+        if (n_rs_seq > 0) {
+            return n_rs_seq + 1;
+        }
+        return n_rs_replay > 0 && n_ubatch > n_rs_replay ? n_rs_replay : 0;
+    }
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -90,6 +113,10 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // replay rollback: committed log tokens to replay (rp_c) and the value used by the current ubatch's inputs (rp_c_in)
+        uint32_t  rp_c    = 0;
+        uint32_t  rp_c_in = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -176,6 +203,10 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // replay rollback: capacity R (0 = off) and the replay count c of the ubatch's cell
+    uint32_t get_rp_cap() const;
+    uint32_t get_rp_c()   const;
 
 private:
     const llama_memory_status status;

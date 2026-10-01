@@ -1301,6 +1301,10 @@ struct cmd_params_instance {
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
 
+        // infernet: LLAMA_BENCH_RS_REPLAY=N builds the GDN replay-rollback graph the server's verify uses (--spec-gdn-replay N)
+        if (const char * rr = getenv("LLAMA_BENCH_RS_REPLAY")) {
+            cparams.n_rs_replay = (uint32_t) atoi(rr);
+        }
         return cparams;
     }
 };
@@ -2151,7 +2155,21 @@ static bool test_prompt(llama_context * ctx, int n_prompt, int n_batch, int n_th
         for (int i = 1; i < n_tokens; i++) {
             tokens[i] = std::rand() % n_vocab;
         }
-        int res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        // infernet: LLAMA_BENCH_ALL_LOGITS=1 asks for logits on every token of a batch <= 16 tokens, like a speculative verify
+        static const bool all_logits = getenv("LLAMA_BENCH_ALL_LOGITS") != nullptr;
+        int res;
+        if (all_logits && n_tokens <= 16) {
+            llama_batch b = llama_batch_init(n_tokens, 0, 1);
+            const llama_pos p0 = llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1;
+            for (int i = 0; i < n_tokens; i++) {
+                b.token[i] = tokens[i]; b.pos[i] = p0 + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 1;
+            }
+            b.n_tokens = n_tokens;
+            res = llama_decode(ctx, b);
+            llama_batch_free(b);
+        } else {
+            res = llama_decode(ctx, llama_batch_get_one(tokens.data(), n_tokens));
+        }
         if (res != 0) {
             fprintf(stderr, "%s: failed to decode prompt batch, res = %d\n", __func__, res);
             return false;

@@ -373,6 +373,29 @@ struct common_params_speculative {
     double synth_len = -1.0;
     std::vector<double> synth_rates;
 
+    // -1 = auto (see need_n_rs_seq). each slot holds one full copy of the model's
+    // recurrent state, so this trades memory against the per-block state snapshot.
+    int32_t n_rs_seq = -1;
+
+    // When set, do not allocate per-token recurrent snapshots. The server keeps one
+    // checkpoint at the start of the block and, on a partial accept, restores it and
+    // replays only the accepted prefix. Default off: today's eager n_rs_seq slots.
+    bool rs_replay = false;
+
+    // infernet GDN replay rollback (docs/replay-rollback.md): 0 = off, N > 0 = the target keeps one committed
+    // recurrent state plus a log of up to R = max(N, rollback depth + 1) tokens instead of the n_rs_seq slots
+    int32_t gdn_replay = 0;
+
+    // After a few blocks, if mean accepted length is below 3.5, cap the draft at 4.
+    // Easy prompts stay at n_max. Default off: K=7 everywhere.
+    bool adapt_k = false;
+
+    // DFlash: inject the verify batch's target features one block late, so the draft
+    // conditions on the features that existed at the START of the verify. This is the
+    // M11 go/no-go: it measures the acceptance cost of pre-drafting during verify
+    // (the phone-overlap design) without implementing the overlap itself. Default off.
+    bool lag_features = false;
+
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
 
@@ -392,8 +415,29 @@ struct common_params_speculative {
     }
 
     uint32_t need_n_rs_seq() const {
+        // explicit override (--spec-n-rs-seq)
+        if (n_rs_seq >= 0) {
+            return (uint32_t) n_rs_seq;
+        }
+
+        // one committed checkpoint plus prefix replay, instead of a snapshot per draft token
+        if (rs_replay) {
+            return 0;
+        }
+
+        // recurrent-state rollback slots let the target roll back rejected draft tokens in
+        // place. without them the server snapshots the whole recurrent state once per
+        // speculative block - 169 MiB on Qwen3.8-27B, which costs more than the draft itself.
+        //
+        // NOTE: extending this to DRAFT_SIMPLE aborts in common_context_seq_rm: the draft
+        // context is pinned to n_rs_seq=0 (common.cpp, cparams_dft) and the server's
+        // draft-side rollback then assumes a partial seq_rm the draft memory cannot do.
+        // Fixing that means giving the draft context its own rollback slots too.
         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
-            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP    ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH ||
+                   t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
         return needs_rs_seq ? draft.n_max : 0u;

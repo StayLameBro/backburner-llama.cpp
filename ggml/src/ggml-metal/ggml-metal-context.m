@@ -1,3 +1,5 @@
+#include <stdatomic.h>
+#include "ggml-metal-coattn.h"
 #import "ggml-metal-context.h"
 
 #import "ggml-impl.h"
@@ -16,6 +18,45 @@
 #undef MAX
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
+
+
+// infernet: GGML_METAL_TIMELINE=<file> logs one line per command buffer with its GPU start/end (host clock, seconds) and
+// CPU-side markers (graph submit, synchronize wait), so a real server round can be split into GPU busy time and idle gaps.
+//   G <ctx> <n_nodes> <cpu_t>              graph_compute entered
+//   C <ctx> <kind> <tag> <gpu_t0> <gpu_t1>  command buffer finished on the GPU (kind: g=graph part, s=set, r=get, x=copy)
+//   W <ctx> <cpu_t0> <cpu_t1>              synchronize(): CPU blocked waiting for the GPU
+#include <mach/mach_time.h>
+static FILE * g_tl_file = NULL;
+static int    g_tl_init = 0;
+static double ggml_metal_tl_now(void) {
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) {
+        mach_timebase_info(&tb);
+    }
+    return (double) mach_absolute_time() * tb.numer / tb.denom * 1e-9;
+}
+static FILE * ggml_metal_tl(void) {
+    if (!g_tl_init) {
+        g_tl_init = 1;
+        const char * path = getenv("GGML_METAL_TIMELINE");
+        if (path && *path) {
+            g_tl_file = fopen(path, "w");
+            if (g_tl_file) {
+                setvbuf(g_tl_file, NULL, _IOFBF, 1 << 20);
+            }
+        }
+    }
+    return g_tl_file;
+}
+static void ggml_metal_tl_cb(id<MTLCommandBuffer> cmd_buf, const void * ctx, char kind, int tag) {
+    FILE * f = ggml_metal_tl();
+    if (!f) {
+        return;
+    }
+    [cmd_buf addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+        fprintf(f, "C %p %c %d %.6f %.6f\n", ctx, kind, tag, [cb GPUStartTime], [cb GPUEndTime]);
+    }];
+}
 
 // max number of MTLCommandBuffer used to submit a graph for processing
 #define GGML_METAL_MAX_COMMAND_BUFFERS 8
@@ -82,6 +123,11 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+
+    // per-op GPU profiler (GGML_METAL_OP_PROFILE=N: serialize the graph, one command buffer
+    // per node, and dump the accumulated GPU time every N graph computes)
+    int op_profile;
+    int op_profile_n;
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -144,6 +190,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         {
             const char * val = getenv("GGML_METAL_GRAPH_DEBUG");
             res->debug_graph = val ? atoi(val) : 0;
+        }
+
+        {
+            const char * val = getenv("GGML_METAL_OP_PROFILE");
+            res->op_profile   = val ? atoi(val) : 0;
+            res->op_profile_n = 0;
         }
 
         res->use_graph_optimize = true;
@@ -254,8 +306,17 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
+        FILE * tl = ggml_metal_tl();
+        const double t0 = tl ? ggml_metal_tl_now() : 0.0;
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
+        if (tl) {
+            fprintf(tl, "W %p %.6f %.6f\n", (void *) ctx, t0, ggml_metal_tl_now());
+            static int n_w = 0;
+            if (++n_w % 64 == 0) {
+                fflush(tl);
+            }
+        }
     }
 
     // check status of all command buffers
@@ -353,6 +414,7 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
                            size:size];
 
         [encoder endEncoding];
+        ggml_metal_tl_cb(cmd_buf, ctx, 's', (int) size);
         [cmd_buf commit];
 
         [ctx->buf_refs addObject:buf_src];
@@ -399,6 +461,7 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
                            size:size];
 
         [encoder endEncoding];
+        ggml_metal_tl_cb(cmd_buf, ctx, 'r', (int) size);
         [cmd_buf commit];
 
         [ctx->buf_refs addObject:buf_dst];
@@ -454,6 +517,7 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
         ggml_metal_event_t ev_cpy = ggml_metal_get_ev_cpy(ctx_src);
         ggml_metal_event_encode_signal(ev_cpy, cmd_buf);
 
+        ggml_metal_tl_cb(cmd_buf, ctx_src, 'x', (int) ggml_nbytes(src));
         [cmd_buf commit];
 
         // do not wait here for completion
@@ -471,10 +535,274 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// per-op GPU profiler
+//
+// GGML_METAL_OP_PROFILE=N serializes the graph: every node is encoded into its own
+// command buffer which is committed and waited on, so GPUEndTime-GPUStartTime is that
+// node's own GPU time. Wall-clock throughput is meaningless in this mode (no overlap,
+// no cross-node fusion) but the relative per-op breakdown is what we are after.
+// The table is dumped and reset every N graph computes.
+// ---------------------------------------------------------------------------
+
+#define GGML_METAL_PROF_MAX_ROWS 512
+
+struct ggml_metal_prof_row {
+    char   key[96];
+    double t_us;
+    int    n;
+    double rd; // bytes read from device memory by the (fused) node group, summed over calls
+    double wr; // bytes written
+};
+
+static struct ggml_metal_prof_row g_prof_rows[GGML_METAL_PROF_MAX_ROWS];
+static int                        g_prof_n_rows = 0;
+static double                     g_prof_t_total_us = 0.0;
+
+// "ffn_gate-37" and "ffn_gate-0" are the same op in different layers - collapse the
+// trailing "-<digits>" so the table is per op role, not per layer.
+static void ggml_metal_prof_key(const struct ggml_tensor * node, char * out, size_t out_sz) {
+    char base[64];
+    snprintf(base, sizeof(base), "%s", node->name[0] ? node->name : ggml_op_name(node->op));
+
+    size_t l = strlen(base);
+    while (l > 0 && base[l - 1] >= '0' && base[l - 1] <= '9') {
+        l--;
+    }
+    if (l > 0 && l < strlen(base) && base[l - 1] == '-') {
+        l--;
+    }
+    base[l] = '\0';
+
+    const struct ggml_tensor * s0 = node->src[0];
+    const struct ggml_tensor * s1 = node->src[1];
+
+    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) {
+        snprintf(out, out_sz, "%-14s %s[%lldx%lld]x%lld",
+                 base,
+                 s0 ? ggml_type_name(s0->type) : "?",
+                 s0 ? (long long) s0->ne[0] : 0,
+                 s0 ? (long long) s0->ne[1] : 0,
+                 s1 ? (long long) s1->ne[1] : 0);
+    } else {
+        snprintf(out, out_sz, "%-14s %s", base, ggml_op_name(node->op));
+    }
+}
+
+static double g_prof_rd_total = 0.0;
+static double g_prof_wr_total = 0.0;
+
+// device-memory traffic of a fused node group gf->nodes[ids[0..n-1]]: every source tensor that
+// is not produced inside the group is read once (weights included), the last node's output is
+// written once. Views count their own extent (a KV view covers only the cells in use).
+static void ggml_metal_prof_bytes(const struct ggml_cgraph * gf, const int * ids, int n, double * rd, double * wr) {
+    const struct ggml_tensor * seen[64];
+    int n_seen = 0;
+    *rd = 0.0;
+    for (int j = 0; j < n; ++j) {
+        const struct ggml_tensor * node = gf->nodes[ids[j]];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            const struct ggml_tensor * src = node->src[s];
+            if (!src) {
+                continue;
+            }
+            bool skip = false;
+            for (int q = 0; q < n && !skip; ++q) {
+                skip = gf->nodes[ids[q]] == src;
+            }
+            for (int q = 0; q < n_seen && !skip; ++q) {
+                skip = seen[q] == src;
+            }
+            if (skip) {
+                continue;
+            }
+            if (n_seen < 64) {
+                seen[n_seen++] = src;
+            }
+            *rd += (double) ggml_nbytes(src);
+        }
+    }
+    *wr = (double) ggml_nbytes(gf->nodes[ids[n - 1]]);
+}
+
+static void ggml_metal_prof_add(const struct ggml_tensor * node, double t_us, double rd, double wr) {
+    char key[96];
+    ggml_metal_prof_key(node, key, sizeof(key));
+
+    g_prof_t_total_us += t_us;
+    g_prof_rd_total   += rd;
+    g_prof_wr_total   += wr;
+
+    for (int i = 0; i < g_prof_n_rows; ++i) {
+        if (strcmp(g_prof_rows[i].key, key) == 0) {
+            g_prof_rows[i].t_us += t_us;
+            g_prof_rows[i].n++;
+            g_prof_rows[i].rd += rd;
+            g_prof_rows[i].wr += wr;
+            return;
+        }
+    }
+
+    if (g_prof_n_rows < GGML_METAL_PROF_MAX_ROWS) {
+        snprintf(g_prof_rows[g_prof_n_rows].key, sizeof(g_prof_rows[0].key), "%s", key);
+        g_prof_rows[g_prof_n_rows].t_us = t_us;
+        g_prof_rows[g_prof_n_rows].n    = 1;
+        g_prof_rows[g_prof_n_rows].rd   = rd;
+        g_prof_rows[g_prof_n_rows].wr   = wr;
+        g_prof_n_rows++;
+    }
+}
+
+static int ggml_metal_prof_cmp(const void * a, const void * b) {
+    const struct ggml_metal_prof_row * ra = a;
+    const struct ggml_metal_prof_row * rb = b;
+    return (ra->t_us < rb->t_us) - (ra->t_us > rb->t_us);
+}
+
+static void ggml_metal_prof_dump(int n_graphs) {
+    qsort(g_prof_rows, g_prof_n_rows, sizeof(g_prof_rows[0]), ggml_metal_prof_cmp);
+
+    GGML_LOG_WARN("METAL-PROF: %d graph computes, %.3f ms GPU total, %.3f ms/graph, %.1f MB read + %.1f MB written /graph\n",
+                  n_graphs, g_prof_t_total_us/1000.0, g_prof_t_total_us/1000.0/n_graphs,
+                  g_prof_rd_total/1e6/n_graphs, g_prof_wr_total/1e6/n_graphs);
+    GGML_LOG_WARN("METAL-PROF: %8s %6s %9s %7s  %s\n", "us/graph", "share", "us/call", "calls", "op");
+
+    double acc = 0.0;
+    for (int i = 0; i < g_prof_n_rows; ++i) {
+        const double share = 100.0*g_prof_rows[i].t_us/g_prof_t_total_us;
+        acc += share;
+        GGML_LOG_WARN("METAL-PROF: %8.1f %5.1f%% %9.1f %7d  %s\n",
+                      g_prof_rows[i].t_us/n_graphs,
+                      share,
+                      g_prof_rows[i].t_us/g_prof_rows[i].n,
+                      g_prof_rows[i].n,
+                      g_prof_rows[i].key);
+        // traffic line: MB read / written per call, and the achieved GB/s while this op runs
+        GGML_LOG_WARN("METAL-BYTES: %10.3f %10.3f %8.1f  %s\n",
+                      g_prof_rows[i].rd/1e6/g_prof_rows[i].n,
+                      g_prof_rows[i].wr/1e6/g_prof_rows[i].n,
+                      (g_prof_rows[i].rd + g_prof_rows[i].wr)/1e3/g_prof_rows[i].t_us,
+                      g_prof_rows[i].key);
+        if (acc > 99.9) {
+            break;
+        }
+    }
+
+    g_prof_n_rows     = 0;
+    g_prof_t_total_us = 0.0;
+    g_prof_rd_total   = 0.0;
+    g_prof_wr_total   = 0.0;
+}
+
+static enum ggml_status ggml_metal_graph_compute_profiled(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
+
+    // ggml_metal_op skips empty nodes, and the n_fuse it returns counts non-empty nodes,
+    // so walk the same filtered list here
+    int * ids = malloc(gf->n_nodes*sizeof(int));
+    int   n   = 0;
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        if (!ggml_op_is_empty(gf->nodes[i]->op) && !ggml_is_empty(gf->nodes[i])) {
+            ids[n++] = i;
+        }
+    }
+
+    enum ggml_status status = GGML_STATUS_SUCCESS;
+
+    for (int k = 0; k < n; ) {
+        const int idx = ids[k];
+
+        struct ggml_tensor * node = gf->nodes[idx];
+
+        id<MTLCommandBuffer> cmd_buf = [queue commandBuffer];
+        [cmd_buf retain];
+
+        ggml_metal_op_t ctx_op = ggml_metal_op_init(
+            ctx->dev,
+            cmd_buf,
+            gf,
+            ctx->finfo,
+            idx,
+            gf->n_nodes, // full window so the fusion table can still look ahead
+            /*use_concurrency =*/ false,
+            /*use_capture     =*/ false,
+            /*debug_graph     =*/ 0);
+
+        const int res = ggml_metal_op_encode(ctx_op, 0);
+
+        ggml_metal_op_free(ctx_op);
+
+        [cmd_buf commit];
+        [cmd_buf waitUntilCompleted];
+
+        if ([cmd_buf status] != MTLCommandBufferStatusCompleted) {
+            GGML_LOG_ERROR("%s: node %d (%s) failed\n", __func__, idx, node->name);
+            [cmd_buf release];
+            ctx->has_error = true;
+            status = GGML_STATUS_FAILED;
+            break;
+        }
+
+        {
+            double rd, wr;
+            ggml_metal_prof_bytes(gf, ids + k, res > 0 ? MIN(res, n - k) : 1, &rd, &wr);
+            ggml_metal_prof_add(node, 1e6*([cmd_buf GPUEndTime] - [cmd_buf GPUStartTime]), rd, wr);
+        }
+
+        [cmd_buf release];
+
+        k += res > 0 ? res : 1;
+    }
+
+    free(ids);
+
+    ctx->cmd_buf_last = nil;
+
+    if (++ctx->op_profile_n >= ctx->op_profile) {
+        ggml_metal_prof_dump(ctx->op_profile_n);
+        ctx->op_profile_n = 0;
+    }
+
+    return status;
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
+    }
+
+    // SME co-attention: fresh shared-event values for this graph's jobs (node idx -> base + 2*idx + {1, 2})
+    ggml_metal_coattn_graph_begin(gf->n_nodes);
+
+    if (ctx->op_profile > 0) {
+        @autoreleasepool {
+            return ggml_metal_graph_compute_profiled(ctx, gf);
+        }
+    }
+
+    // infernet: GGML_METAL_COUNT=1 prints dispatches and memory barriers of the previous graph (encoding is async, so
+    // the counts printed at the start of graph k belong to graph k-1)
+    {
+        extern atomic_int ggml_metal_n_dispatch;
+        extern atomic_int ggml_metal_n_barrier;
+        static int count = -1;
+        if (count < 0) {
+            count = getenv("GGML_METAL_COUNT") != NULL;
+        }
+        if (count) {
+            const int nd = atomic_exchange(&ggml_metal_n_dispatch, 0);
+            const int nb = atomic_exchange(&ggml_metal_n_barrier, 0);
+            GGML_LOG_WARN("METAL-COUNT: prev graph %d dispatches %d barriers (this graph %d nodes)\n", nd, nb, gf->n_nodes);
+        }
+    }
+
+    {
+        FILE * tl = ggml_metal_tl();
+        if (tl) {
+            fprintf(tl, "G %p %d %.6f\n", (void *) ctx, gf->n_nodes, ggml_metal_tl_now());
+        }
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -496,7 +824,15 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     @autoreleasepool {
         ctx->gf = gf;
 
-        if (ctx->n_cb == 0) {
+        // a pipelined prefill ubatch (phone-held KV, LLAMA_REMOTE_PIPE: grouped attention with op_params[8] > 0) defers each
+        // half's phone merge past the other half's nodes; that deferral lives in one command buffer, so encode it as one
+        bool pipelined = false;
+        for (int i = 0; i < gf->n_nodes && !pipelined; i++) {
+            const struct ggml_tensor * t = gf->nodes[i];
+            pipelined = t->op == GGML_OP_FLASH_ATTN_EXT && t->op_params[8] > 0;
+        }
+
+        if (ctx->n_cb == 0 || pipelined) {
             // single-threaded encoding: the whole graph is encoded by one command buffer
             ctx->n_nodes_0      = gf->n_nodes;
             ctx->n_nodes_1      = 0;
@@ -762,6 +1098,8 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         }
 
         ggml_metal_op_free(ctx_op);
+
+        ggml_metal_tl_cb(cmd_buf, ctx, 'g', ctx->gf->n_nodes*16 + cb_idx);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
             [cmd_buf commit];

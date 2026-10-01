@@ -4383,3 +4383,42 @@ void llama_perf_sampler_reset(struct llama_sampler * chain) {
     ctx->t_sample_us = 0;
     ctx->n_sample    = 0;
 }
+
+// infernet: true if the sampler (or chain) always selects argmax(logits), so a batched argmax over all
+// output rows can replace the per-row backend sampler graphs (LLAMA_BATCHED_ARGMAX=1, llm_graph_context::build_sampling).
+// Order-preserving filters that always keep the top token (top-k, top-p, min-p, no-op "?" samplers) may precede
+// the greedy step; anything else (penalties, logit bias, DRY, XTC, typical, ...) disqualifies.
+bool llama_sampler_is_greedy_equiv(const struct llama_sampler * smpl) {
+    if (smpl == nullptr) {
+        return false;
+    }
+    if (smpl->iface == &llama_sampler_greedy_i) {
+        return true;
+    }
+    if (smpl->iface == &llama_sampler_temp_i) {
+        return ((const llama_sampler_temp *) smpl->ctx)->temp <= 0.0f;
+    }
+    if (smpl->iface == &llama_sampler_temp_ext_i) {
+        return ((const llama_sampler_temp_ext *) smpl->ctx)->temp <= 0.0f;
+    }
+    if (smpl->iface != &llama_sampler_chain_i) {
+        return false;
+    }
+    for (const auto & entry : ((const llama_sampler_chain *) smpl->ctx)->samplers) {
+        const auto * s = entry.ptr;
+        if (s->iface == &llama_sampler_greedy_i || s->iface == &llama_sampler_temp_i || s->iface == &llama_sampler_temp_ext_i) {
+            return llama_sampler_is_greedy_equiv(s);
+        }
+        if (s->iface == &llama_sampler_empty_i || s->iface == &llama_sampler_top_k_i ||
+            s->iface == &llama_sampler_top_p_i || s->iface == &llama_sampler_min_p_i ||
+            s->iface == &llama_sampler_logit_bias_i) { // logit bias: applied to every row before the argmax
+            continue;
+        }
+        return false;
+    }
+    return false;
+}
+
+bool llama_sampler_is_logit_bias(const struct llama_sampler * smpl) {
+    return smpl != nullptr && smpl->iface == &llama_sampler_logit_bias_i;
+}

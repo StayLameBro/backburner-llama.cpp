@@ -363,6 +363,8 @@ extern "C" {
         uint32_t n_ubatch;              // physical maximum batch size
         uint32_t n_seq_max;             // max number of sequences (i.e. distinct states for recurrent models)
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+        uint32_t n_rs_replay;           // infernet: GDN replay rollback capacity R (0 = off): one committed state + a log of up to R
+                                        //   tokens replayed at the next decode; llama_n_rs_seq() then reports R - 1 [EXPERIMENTAL]
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation
@@ -811,6 +813,22 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    //
+    // Phone-held KV (infernet, docs/phone-kv-262k.md): the oldest positions of sequence 0 live on a phone (or any
+    // phone-attn server) that computes their share of every attention op. Metal backend, flash attention, f16/q8_0 KV.
+    //
+
+    // Connect the context's KV cache to the phone-attn server at "host:port". Call before the first decode.
+    // Returns 0 on success.
+    LLAMA_API int32_t llama_kv_remote_attach(struct llama_context * ctx, const char * host_port);
+
+    // Move the n oldest Mac-held positions of sequence 0 to the phone (rounded down to a multiple of 64) and free their
+    // cells on the Mac. Returns the number of positions moved, or -1 on error.
+    LLAMA_API int32_t llama_kv_remote_evict(struct llama_context * ctx, int32_t n);
+
+    // Number of positions held by the phone.
+    LLAMA_API int32_t llama_kv_remote_n(struct llama_context * ctx);
 
     //
     // State / sessions

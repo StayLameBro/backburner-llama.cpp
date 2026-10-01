@@ -2340,7 +2340,27 @@ struct llama_model_qwen35 : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
+        // infernet pipelined prefill: a layers-only builder for one half of the ubatch (params carry the half's ubatch)
+        graph(const llama_model & model, const llm_graph_params & params, int half);
     private:
+        // one decoder block (norm, gated delta net or attention, FFN, residuals); returns the block's output
+        ggml_tensor * build_block(
+             llm_graph_input_rs * inp_recr,
+        llm_graph_input_attn_kv * inp_attn,
+                    ggml_tensor * inpL,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il,
+                    ggml_tensor * inp_out_ids);
+
+        // all layers as two staggered halves (LLAMA_REMOTE_PIPE): nullptr if this ubatch can't be pipelined
+        ggml_tensor * build_pipelined(
+        const llm_graph_params & params,
+       llm_graph_input_mem_hybrid * inp,
+                    ggml_tensor * inpL,
+                    ggml_tensor * inp_pos,
+                            int * sections);
+
         ggml_tensor * build_layer_attn(
         llm_graph_input_attn_kv * inp_attn,
                     ggml_tensor * cur,
@@ -2351,6 +2371,16 @@ struct llama_model_qwen35 : public llama_model_base {
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,
                     ggml_tensor * cur,
+                            int   il);
+
+        // infernet GDN replay rollback: conv + delta net over [replayed log | new tokens], one committed state
+        ggml_tensor * build_layer_attn_linear_replay(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * qkv_mixed,
+                    ggml_tensor * gate,
+                    ggml_tensor * beta,
+                    ggml_tensor * alpha_raw,
+                    ggml_tensor * beta_raw,
                             int   il);
 
         ggml_tensor * build_layer_ffn(
@@ -2389,7 +2419,11 @@ struct llama_model_qwen4exp : public llama_model_base {
 
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
-    private:
+    protected:
+        struct no_build_t {};
+        graph(const llama_model & model, const llm_graph_params & params, no_build_t) :
+            llm_build_delta_net_base(params), model(model) {}
+
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2479,6 +2513,10 @@ struct llama_model_qwen4exp : public llama_model_base {
                             int   il);
 
         const llama_model & model;
+    };
+
+    struct graph_mtp : public graph {
+        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

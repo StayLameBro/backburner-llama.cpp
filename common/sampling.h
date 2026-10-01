@@ -4,6 +4,7 @@
 
 #include "common.h"
 
+#include <random>
 #include <string>
 #include <vector>
 
@@ -84,6 +85,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // returns at least 1 token, up to idxs.size()
 //
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+
+// infernet: the proposal distribution one draft token was sampled from (ids + probabilities, need not be normalized to the
+// full vocab: tokens outside `ids` have q = 0). Empty = the token was chosen deterministically (q is a point mass on it).
+struct common_draft_dist {
+    std::vector<llama_token> ids;
+    std::vector<float>       p;
+};
+
+// infernet: speculative sampling (Leviathan et al. 2023, Chen et al. 2023). draft[i] ~ q[i]; accept it with probability
+// min(1, p(x)/q(x)) where p is the target sampler's distribution after its whole chain; on reject, sample from
+// normalize(max(0, p - q)) and stop. Every emitted token has exactly the target sampler's distribution. With a point-mass q
+// this equals common_sampler_sample_and_accept_n in distribution. Falls back to that function under backend sampling.
+std::vector<llama_token> common_sampler_sample_and_accept_n_spec(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<common_draft_dist> & q, std::mt19937 & rng);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);

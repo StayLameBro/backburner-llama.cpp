@@ -4154,6 +4154,52 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SYNTH_LEN"));
     add_opt(common_arg(
+        {"--spec-n-rs-seq"}, "N",
+        "recurrent-state rollback slots on the target (-1 = auto). models with recurrent state\n"
+        "(Qwen3.5/3.8 GDN, Mamba, LFM2, ...) otherwise snapshot the whole state once per\n"
+        "speculative block. each slot costs one copy of the recurrent state.",
+        [](common_params & params, int value) {
+            params.speculative.n_rs_seq = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_N_RS_SEQ"));
+    add_opt(common_arg(
+        {"--spec-rs-replay"},
+        {"--no-spec-rs-replay"},
+        "on rejection, restore the one committed recurrent state and replay the accepted prefix\n"
+        "instead of keeping a snapshot slot per draft token (default: disabled)",
+        [](common_params & params, bool value) {
+            params.speculative.rs_replay = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_RS_REPLAY"));
+    add_opt(common_arg(
+        {"--spec-gdn-replay"}, "N",
+        "GDN replay rollback on the target (qwen35, one sequence): keep one committed recurrent state plus a log of\n"
+        "the last verify batch (max(N, rollback depth + 1) tokens) and replay the accepted tokens at the next verify,\n"
+        "instead of one state slot per draft token (0 = off, default). Env override for any tool: LLAMA_GDN_REPLAY=R",
+        [](common_params & params, int value) {
+            params.speculative.gdn_replay = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_GDN_REPLAY"));
+    add_opt(common_arg(
+        {"--spec-adapt-k"},
+        {"--no-spec-adapt-k"},
+        "shorten the draft to 4 tokens when recent acceptance is below 3.5 (default: disabled, K stays at n-max)",
+        [](common_params & params, bool value) {
+            params.speculative.adapt_k = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_ADAPT_K"));
+    add_opt(common_arg(
+        {"--spec-lag-features"},
+        {"--no-spec-lag-features"},
+        "DFlash: inject the verify batch's target features one block late, so the draft\n"
+        "conditions on the features that existed at the START of verify (default: disabled).\n"
+        "Measures the acceptance cost of pre-drafting during verify -- the go/no-go for\n"
+        "overlapping a phone-hosted draft with the Mac's verify.",
+        [](common_params & params, bool value) {
+            params.speculative.lag_features = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_LAG_FEATURES"));
+    add_opt(common_arg(
         {"--spec-synth-rates"}, "P0,P1,...",
         "comma-separated unconditional per-position synthetic acceptance probabilities (benchmarking only)",
         [](common_params & params, const std::string & value) {

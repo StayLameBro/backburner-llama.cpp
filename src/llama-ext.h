@@ -100,6 +100,31 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
 // chain multiple trained NextN heads. Default 0 (first head).
 LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
 
+// Split prefill: run only decoder layers [il_start, il_end) of the model (il_end < 0 -> n_layer).
+//  - il_start > 0: the batch must carry embd = the residual stream entering layer il_start
+//    (for M-RoPE models pos must then have n_pos_per_embd*n_tokens entries)
+//  - il_end < n_layer: output norm + lm_head are skipped; read the residual leaving layer il_end-1
+//    with llama_set_embeddings_layer_inp(ctx, il_end, true) + llama_get_embeddings_layer_inp(ctx, il_end)
+// Layers outside the range leave their memory (KV / recurrent state) untouched.
+// Currently implemented by: qwen35
+LLAMA_API void llama_set_layer_range(struct llama_context * ctx, int32_t il_start, int32_t il_end);
+
+// infernet: FFN offload. For layers [il0, il1) the graph replaces the FFN (up/gate/down matmuls + SwiGLU) with one op run
+// on a CPU thread that calls fn(y, x, n_embd, n_tokens, il, user): x = the FFN input (post-attention RMSNorm output) and
+// y = the FFN output, both f32 [n_tokens][n_embd]. fn returns false on failure (y is then garbage); the caller checks
+// llama_ffn_offload_failed() after llama_decode. fn = NULL or il0 >= il1 turns it off. Used by the phone tail to run the
+// FFN on the Neural Engine. Currently implemented by: qwen35
+typedef bool (*llama_ffn_offload_fn)(float * y, const float * x, int32_t n_embd, int32_t n_tokens, int32_t il, void * user);
+LLAMA_API void llama_set_ffn_offload(struct llama_context * ctx, int32_t il0, int32_t il1, llama_ffn_offload_fn fn, void * user);
+// true if an offloaded FFN failed since the last call (and clears the flag)
+LLAMA_API bool llama_ffn_offload_failed(struct llama_context * ctx);
+
+// infernet: filter for the next llama_state_seq_{get_size,get_data,set_data} calls on this thread (see llama_state_filter
+// in llama-memory.h). kv_mode / rs_mode: 0 replace, 1 append (KV only), 2 overwrite rows of existing cells.
+// kv / rs: include the attention KV part / the recurrent part of a hybrid memory. Call llama_state_filter_clear() after.
+LLAMA_API void llama_state_filter_set(int32_t p0, int32_t p1, int32_t il0, int32_t il1, int32_t kv_mode, int32_t rs_mode, bool kv, bool rs);
+LLAMA_API void llama_state_filter_clear(void);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

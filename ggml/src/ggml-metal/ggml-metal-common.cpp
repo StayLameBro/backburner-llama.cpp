@@ -1,4 +1,6 @@
 #include "ggml-metal-common.h"
+
+#include <cstdlib>
 #include "ggml-metal-fusion.h"
 
 #include "ggml.h"
@@ -25,20 +27,114 @@ bool ggml_metal_op_mul_mat_use_fwht(const struct ggml_tensor * op) {
            ggml_metal_fwht_supported_size(op->src[1]->ne[0]);
 }
 
+// smallest src1 column count that goes to the simdgroup-matrix GEMM instead of the
+// per-column mat-vec kernels. with the narrow (8/16-column) GEMM tiles the GEMM wins from
+// 4 columns up on the quantized types; upstream's value was 9.
+// GGML_METAL_MUL_MM_MIN_NE11=9 restores it.
+static int64_t ggml_metal_mul_mm_min_ne11(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_METAL_MUL_MM_MIN_NE11");
+        v = s ? atoi(s) : 4;
+        if (v < 1) v = 1;
+    }
+    return v;
+}
+
+// infernet round-cost: multi-column iq4_xs mat-vec (kernel_mul_mv_iq4_xs_f32_nc, one weight decode for all columns) for
+// short verify batches. The regfed GEMM pads the batch to 8 columns, so 2..8 columns all cost ~259 us on ffn_up; this
+// kernel runs 199 / 248 us at 2 / 3 columns (the 1-column bandwidth floor is 203) but loses from 4 (327, 433 at 5).
+// GGML_METAL_MV_NC=N routes iq4_xs at 2..N columns (max 8) here, ahead of regfed / mul_mm / mul_mv_ext; use 3. Off by
+// default: production verifies are 5 or 8 rows. The row count must be a multiple of 32 (whole NR0*NSG row groups).
+int ggml_metal_mv_nc_max(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_METAL_MV_NC");
+        v = s ? atoi(s) : 0;
+        if (v > 8) v = 8;
+    }
+    return v;
+}
+
+bool ggml_metal_op_mul_mat_use_mv_nc(const struct ggml_tensor * op) {
+    const ggml_tensor * s0 = op->src[0];
+    const ggml_tensor * s1 = op->src[1];
+    return s0->type == GGML_TYPE_IQ4_XS && s1->type == GGML_TYPE_F32 &&
+           s1->ne[1] >= 2 && s1->ne[1] <= ggml_metal_mv_nc_max() &&
+           s0->ne[0] % 256 == 0 && s0->ne[1] % 32 == 0 && s1->nb[0] == sizeof(float);
+}
+
 bool ggml_metal_op_mul_mat_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne11 = op->src[1]->ne[1];
 
+    const int64_t min_ne11 = ggml_is_quantized(op->src[0]->type)
+        ? ggml_metal_mul_mm_min_ne11()
+        : 9;
+
+    if (ggml_metal_op_mul_mat_use_mv_nc(op)) {
+        return false;
+    }
+
+    // q4_K at 2..8 columns goes to the multi-column mat-vec (QMV) instead of the GEMM:
+    // the GEMM's threadgroup staging costs ~4 bytes of shared-memory traffic per weight
+    // element regardless of quant type, which dominates a short speculative verify.
+    if (op->src[0]->type == GGML_TYPE_Q4_K && op->src[1]->type == GGML_TYPE_F32 &&
+        ne11 >= 2 && ne11 <= (getenv("GGML_METAL_QMV_MAX") ? atoi(getenv("GGML_METAL_QMV_MAX")) : 3) && getenv("GGML_METAL_QMV") != NULL) {
+        return false;
+    }
+
+    // Wide mat-vec (GGML_METAL_QMV_WIDE=1, default off). iq3_s / iq3_xxs / iq4_xs at
+    // 2..N columns stay on mul_mv and never enter mul_mm, so they do not pay the
+    // ~100 ms threadgroup staging that makes batch 2 cost 82 ms more than batch 1.
+    // GGML_METAL_QMV_WIDE_MAX caps N (default 5).
+    if ((op->src[0]->type == GGML_TYPE_IQ3_S || op->src[0]->type == GGML_TYPE_IQ3_XXS ||
+         op->src[0]->type == GGML_TYPE_IQ4_XS) &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        ne11 >= 2 && ne11 <= (getenv("GGML_METAL_QMV_WIDE_MAX") ? atoi(getenv("GGML_METAL_QMV_WIDE_MAX")) : 5) &&
+        getenv("GGML_METAL_QMV_WIDE") != NULL && atoi(getenv("GGML_METAL_QMV_WIDE")) != 0) {
+        return false;
+    }
+
+    // iq4_xs likewise, but out to 8 columns: that kernel has no dmin correction and only
+    // 8 values per lane, so it holds 8 activation columns in registers where q4_K spilled
+    // at 3. 8 columns is a verify of n_max=7, which is the width this project actually runs.
+    if (op->src[0]->type == GGML_TYPE_IQ4_XS && op->src[1]->type == GGML_TYPE_F32 &&
+        getenv("GGML_METAL_QMV_IQ4XS") != NULL && atoi(getenv("GGML_METAL_QMV_IQ4XS")) != 0 &&
+        ne11 >= 2 && ne11 <= (getenv("GGML_METAL_QMV_IQ4XS_MAX") ? atoi(getenv("GGML_METAL_QMV_IQ4XS_MAX")) : 8)) {
+        return false;
+    }
+
     return !ggml_is_transposed(op->src[0]) &&
            !ggml_is_transposed(op->src[1]) &&
-           has_simdgroup_mm && ne00 >= 64 && ne11 > 8;
+           has_simdgroup_mm && ne00 >= 64 && ne11 >= min_ne11;
+}
+
+// smallest token count that sends a mixture-of-experts matmul to the simdgroup-matrix GEMM
+// instead of the per-expert mat-vec path. Upstream's value is 32.
+//
+// This matters a lot for speculative verification. A verify of n_max=7 is 8 tokens, so
+// ne21 = 8 < 32 and the whole MoE FFN runs on the vector path -- never touching the
+// simdgroup matrix units. A per-op GPU trace of this model puts the FFN at 54.9% of the
+// verify graph, spread over per-expert calls of 2-5 columns each.
+// Measured +1.5% on the code prompt set (paired by prompt, acceptance identical to 3 d.p.
+// on every prompt), so the default here is 8 rather than upstream's 32.
+// GGML_METAL_MUL_MAT_ID_MIN_NE21=32 restores upstream behaviour.
+static int64_t ggml_metal_mul_mat_id_min_ne21(void) {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char * s = getenv("GGML_METAL_MUL_MAT_ID_MIN_NE21");
+        v = s ? atoi(s) : 8;
+        if (v < 1) v = 1;
+    }
+    return v;
 }
 
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm) {
     const int64_t ne00 = op->src[0]->ne[0];
     const int64_t ne21 = op->src[2]->ne[1];
 
-    return has_simdgroup_mm && ne00 >= 64 && ne21 >= 32;
+    return has_simdgroup_mm && ne00 >= 64 && ne21 >= ggml_metal_mul_mat_id_min_ne21();
 }
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -82,6 +178,23 @@ static bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
 }
 
 static ggml_mem_range ggml_mem_range_from_tensor(const ggml_tensor * tensor, ggml_mem_range_type pt) {
+    // infernet round-cost: GGML_METAL_VIEW_RANGES (default on) - an allocated view covers only the bytes it spans
+    // ([data, data + ggml_nbytes), exact for any non-negative strides) instead of its whole base tensor, so writes to
+    // disjoint slices of one cache (e.g. the GDN replay log CPYs into one r row, K/V SET_ROWS) no longer force barriers
+    static const bool view_ranges = [] {
+        const char * e = getenv("GGML_METAL_VIEW_RANGES");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
+    if (view_ranges && tensor->view_src && tensor->buffer && tensor->data) {
+        return {
+            /*.pb =*/ (uint64_t) tensor->buffer,
+            /*.p0 =*/ (uint64_t) tensor->data,
+            /*.p1 =*/ (uint64_t) tensor->data + ggml_nbytes(tensor),
+            /*.pt =*/ pt,
+        };
+    }
+
     // always use the base tensor
     tensor = tensor->view_src ? tensor->view_src : tensor;
 
@@ -158,6 +271,12 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
 }
 
 static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
+    // ranges are half-open [p0, p1): with GGML_METAL_VIEW_RANGES, ranges that only touch do not conflict
+    static const bool strict = [] {
+        const char * e = getenv("GGML_METAL_VIEW_RANGES");
+        return e == nullptr || atoi(e) != 0;
+    }();
+
     for (size_t i = 0; i < mrs->ranges.size(); i++) {
         const auto & cmp = mrs->ranges[i];
 
@@ -171,7 +290,7 @@ static bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, ggml_mem_range mr) {
             continue;
         }
 
-        if (mr.p0 < cmp.p1 && mr.p1 >= cmp.p0) {
+        if (mr.p0 < cmp.p1 && (strict ? mr.p1 > cmp.p0 : mr.p1 >= cmp.p0)) {
             if (mrs->debug > 2) {
                 GGML_LOG_DEBUG("%s: the %s range buf=%lld, [%lld, %lld) overlaps with a previous %s range buf=%lld, [%lld, %lld)\n",
                         __func__,
@@ -356,6 +475,10 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_CONT:
             case GGML_OP_REPEAT:
                 return true;
+            case GGML_OP_CONCAT:
+                // infernet: a concat reads its two sources and writes its own dst, like CPY; the GDN replay graph has
+                // three per layer, and stopping the look-ahead at each one serialized the g/beta chains behind the conv chain
+                return getenv("GGML_METAL_REORDER_NO_CONCAT") == nullptr;
             default:
                 return ggml_op_is_empty(op);
         }

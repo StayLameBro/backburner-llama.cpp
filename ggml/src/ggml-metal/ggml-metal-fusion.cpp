@@ -205,7 +205,9 @@ static bool ggml_metal_fusion_check_gdn_cache(
     const int64_t n_tokens = gdn->src[2]->ne[2];
     const int64_t n_seqs   = gdn->src[2]->ne[3];
     const int64_t K        = ggml_get_op_params_i32(gdn, 0);
-    const size_t  tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens * n_seqs);
+    // infernet replay mode: attention rows only for the tokens after the n_replay replayed ones, then one state
+    const int64_t n_out    = n_tokens - (ggml_get_op_params_i32(gdn, 3) != 0 ? ggml_get_op_params_i32(gdn, 1) : 0);
+    const size_t  tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_out * n_seqs);
 
     const int64_t D         = S_v * S_v * H;
     const int64_t n_written = std::min<int64_t>(n_tokens, K);
@@ -232,6 +234,170 @@ static bool ggml_metal_fusion_check_gdn_cache(
         if (dst->data == nullptr) {
             return false;
         }
+    }
+
+    return true;
+}
+
+// infernet round-cost: ADD + RMS_NORM + MUL (GGML_METAL_ADD_NORM, default on). x = a + b is written (it is the residual,
+// read again later), then y = rms_norm(x) * w: one launch and one barrier level less per residual add. Plain
+// same-shape F32 rows only; the weight is one row broadcast over all rows.
+static bool ggml_metal_fusion_check_add_norm_mul(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(fusion);
+    GGML_UNUSED(gf);
+    GGML_UNUSED(node_idxs);
+    GGML_UNUSED(idx);
+    GGML_UNUSED(mode);
+
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_METAL_ADD_NORM");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * add  = nodes[0];
+    const ggml_tensor * norm = nodes[1];
+    const ggml_tensor * mul  = nodes[2];
+
+    const ggml_tensor * a = add->src[0];
+    const ggml_tensor * b = add->src[1];
+    const ggml_tensor * w = mul->src[1];
+
+    if (add->type != GGML_TYPE_F32 || a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 ||
+        norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (!ggml_are_same_shape(a, add) || !ggml_are_same_shape(b, add) || add->ne[2] != 1 || add->ne[3] != 1 ||
+        add->ne[0] % 4 != 0) {
+        return false;
+    }
+    if (!ggml_is_contiguous_rows(a) || !ggml_is_contiguous_rows(b) || !ggml_is_contiguous_rows(add) ||
+        !ggml_is_contiguous_rows(mul)) {
+        return false;
+    }
+    if (norm->src[0] != add || mul->src[0] != norm) {
+        return false;
+    }
+    if (w->ne[0] != add->ne[0] || ggml_nrows(w) != 1 || !ggml_is_contiguous(w)) {
+        return false;
+    }
+
+    return true;
+}
+
+// infernet round-cost: RMS_NORM + MUL + UNARY(silu) + MUL (GGML_METAL_NORM_GATE, default on): the gated output norm of the
+// qwen35 GDN layers, y = ((rms_norm(o)*w) * silu(z)), one kernel instead of two (the silu(z) launch goes too). The silu
+// reads z, not the previous node, so the generic chain check does not apply (unsafe); the subgraph check is done here.
+static bool ggml_metal_fusion_check_norm_gate(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_METAL_NORM_GATE");
+        return e == nullptr || atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * norm = nodes[0];
+    const ggml_tensor * mulw = nodes[1];
+    const ggml_tensor * un   = nodes[2];
+    const ggml_tensor * mulg = nodes[3];
+
+    if (norm->op != GGML_OP_RMS_NORM || mulw->op != GGML_OP_MUL || un->op != GGML_OP_UNARY || mulg->op != GGML_OP_MUL) {
+        return false;
+    }
+    if (ggml_get_unary_op(un) != GGML_UNARY_OP_SILU || un->src[1]) {
+        return false;
+    }
+    if (mulw->src[0] != norm || !((mulg->src[0] == mulw && mulg->src[1] == un) || (mulg->src[0] == un && mulg->src[1] == mulw))) {
+        return false;
+    }
+
+    const ggml_tensor * w = mulw->src[1];
+    const ggml_tensor * z = un->src[0];
+
+    if (norm->type != GGML_TYPE_F32 || mulw->type != GGML_TYPE_F32 || un->type != GGML_TYPE_F32 || mulg->type != GGML_TYPE_F32 ||
+        w->type != GGML_TYPE_F32 || z->type != GGML_TYPE_F32 || norm->src[0]->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (norm->ne[0] % 4 != 0 || !ggml_are_same_shape(norm, mulw) || !ggml_are_same_shape(norm, un) ||
+        !ggml_are_same_shape(norm, mulg) || !ggml_are_same_shape(norm, z)) {
+        return false;
+    }
+    if (w->ne[0] != norm->ne[0] || !ggml_is_contiguous_rows(w) || !ggml_is_contiguous_rows(z) ||
+        !ggml_is_contiguous_rows(norm->src[0]) || !ggml_is_contiguous_rows(mulg)) {
+        return false;
+    }
+
+    // the norm, the w product and the silu must have no uses outside the group
+    const int outputs[1] = { node_idxs[idx + 3] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), outputs, 1)) {
+        return false;
+    }
+
+    return true;
+}
+
+// infernet round-cost: MUL_MAT(gate) + MUL_MAT(up) + GLU swiglu (GGML_METAL_FFN_SWIGLU=1, default OFF: no gain). Structure
+// only here; the matmul encoder uses it only on its register-fed IQ4_XS path and otherwise encodes the nodes one by one.
+// Measured 2026-09-25: bit-identical, -128 launches / -64 barriers per verify, serialized 544 -> 493 us per layer, but the
+// real graph already runs gate and up concurrently: verify 88.99 -> 89.19 ms (3 ABAB), live 89.25 -> 89.7 ms (2 ABAB).
+static bool ggml_metal_fusion_check_ffn_swiglu(
+        const ggml_metal_fusion      * fusion,
+        const ggml_tensor * const    * nodes,
+        const ggml_cgraph            * gf,
+        const int                    * node_idxs,
+              int                      idx,
+              ggml_metal_fusion_mode    mode) {
+    GGML_UNUSED(mode);
+
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_METAL_FFN_SWIGLU");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * mg  = nodes[0];
+    const ggml_tensor * mu  = nodes[1];
+    const ggml_tensor * glu = nodes[2];
+
+    if (mg->op != GGML_OP_MUL_MAT || mu->op != GGML_OP_MUL_MAT || glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0 ||
+        glu->src[0] != mg || glu->src[1] != mu) {
+        return false;
+    }
+    if (mg->src[1] != mu->src[1] || mg->src[0]->type != GGML_TYPE_IQ4_XS || mu->src[0]->type != GGML_TYPE_IQ4_XS ||
+        !ggml_are_same_shape(mg->src[0], mu->src[0]) || mg->src[0]->nb[1] != mu->src[0]->nb[1] ||
+        mg->src[1]->type != GGML_TYPE_F32 || mg->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (mg->src[0]->ne[1] % 16 != 0 || !ggml_are_same_shape(glu, mg) || glu->nb[0] != sizeof(float)) {
+        return false;
+    }
+
+    // gate and up must have no other users
+    const int outputs[1] = { node_idxs[idx + 2] };
+    if (!ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 3, fusion->ops.data(), outputs, 1)) {
+        return false;
     }
 
     return true;
@@ -624,6 +790,10 @@ static const std::vector<ggml_op> ops_topk_moe_norm_scale = {
 
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
+static const std::vector<ggml_op> ops_add_rms_norm_mul = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_norm_gate        = { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_UNARY, GGML_OP_MUL };
+static const std::vector<ggml_op> ops_ffn_swiglu       = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+
 static const std::vector<ggml_op> ops_moe_reduce_2 = { GGML_OP_MUL, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_3 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD };
 static const std::vector<ggml_op> ops_moe_reduce_4 = { GGML_OP_MUL, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD };
@@ -687,6 +857,9 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           ops_moe_reduce_all_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           ops_moe_reduce_all_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          ops_ssm_conv_silu,              {},     false, ggml_metal_fusion_check_ssm_conv_silu },
+    { GGML_METAL_FUSION_ADD_NORM_MUL,   ops_add_rms_norm_mul,       ops_add_rms_norm_mul,           {0},    false, ggml_metal_fusion_check_add_norm_mul },
+    { GGML_METAL_FUSION_NORM_GATE,      ops_norm_gate,              ops_norm_gate,                  {},     true,  ggml_metal_fusion_check_norm_gate },
+    { GGML_METAL_FUSION_FFN_SWIGLU,     ops_ffn_swiglu,             ops_ffn_swiglu,                 {},     true,  ggml_metal_fusion_check_ffn_swiglu },
 };
 
 // ---- alloc deps -----------------------------------------------------------
