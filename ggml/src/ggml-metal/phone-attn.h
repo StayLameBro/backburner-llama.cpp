@@ -21,6 +21,8 @@
 //   ATTN_BIG attn_req + Q f16 [ng][n_head_kv][48][256]       -> ATTN_OK attn_rep + O f16 [ng][n_head_kv][48][256] + lse f32 [ng][n_head_kv][48]
 //              (v3) a whole prefill ubatch in one call: ng = ceil(n_tok / 8) groups of 8 tokens, each laid out exactly like
 //              ATTN; the phone reads its keys for every group in one request (one round trip per layer per ubatch).
+//   FETCH    fetch_req                                       -> OK rows[n*rs]   (v4) keys (which 0) or values (which 1) pos0..pos0+n
+//              of one layer, exactly as APPEND received them: lets the Mac save a state while the phone holds keys
 //   STATS                                                    -> OK text
 //   PING     u32 reply_len + bytes                           -> OK reply_len bytes (link probe)
 //   BYE                                                      -> closed
@@ -70,13 +72,13 @@ void   sme_attn_pipe(void ** pp, int nw, int nh, const float * Q, const uint8_t 
 namespace pa {
 
 constexpr uint32_t MAGIC        = 0x4E544150u; // "PATN"
-constexpr uint32_t VERSION      = 3;           // v3: ATTN_BIG (v2 clients/servers still interoperate on ATTN)
+constexpr uint32_t VERSION      = 4;           // v3: ATTN_BIG (v2 clients/servers still interoperate on ATTN); v4: FETCH
 constexpr int      DEFAULT_PORT = 50062;
 constexpr int      NR           = 48;          // query rows per KV head (8 tokens x GQA 6)
 constexpr int      HD           = 256;         // head dim
 constexpr int      KEY_ALIGN    = 64;          // the SME kernel works in multiples of 64 keys
 
-enum msg : uint32_t { HELLO = 1, HELLO_OK, CONFIG, APPEND, TRUNCATE, ATTN, ATTN_OK, STATS, OK, ERR, BYE, PING, ATTN_BIG };
+enum msg : uint32_t { HELLO = 1, HELLO_OK, CONFIG, APPEND, TRUNCATE, ATTN, ATTN_OK, STATS, OK, ERR, BYE, PING, ATTN_BIG, FETCH };
 constexpr int MAX_GROUPS = 64;                 // ATTN_BIG: up to 512 tokens per call
 
 #pragma pack(push, 1)
@@ -86,6 +88,7 @@ struct config_req { uint32_t n_layer, n_head_kv, rs, hb, is_q8, sme_workers, sme
 // sme_helpers 0: plain SME kernel on sme_workers threads; gpu_permille: share of the pages for the GPU engine (if any); gpu_chunk: keys per GPU threadgroup
 // store_f16: the phone stores q8_0 rows it receives as f16 (2x memory; lets the A19 neural accelerators read K/V directly)
 struct append_req { uint32_t layer, pos0, n; };
+struct fetch_req  { uint32_t layer, pos0, n, which; };                      // which: 0 keys, 1 values
 struct attn_req   { uint32_t layer, n_tok, nk; float scale; };            // nk = 0: all held keys
 struct attn_rep   { uint32_t nk; float phone_ms, gpu_ms, sme_ms; uint32_t gpu_pages, pages; };
 #pragma pack(pop)
@@ -403,6 +406,27 @@ private:
                     }
                     ok = send_msg(fd, OK, nullptr, 0);
                 } break;
+                case FETCH: {
+                    // the held rows as APPEND received them, for a state save on the Mac; rows stored as f16 (store_f16) are
+                    // no longer the bytes the Mac sent, so that mode refuses rather than return something that isn't exact
+                    fetch_req q; if (h.len < sizeof q) { ok = err(fd, "short FETCH"); break; }
+                    memcpy(&q, buf.data(), sizeof q);
+                    if (cfg_.store_f16 && cfg_.is_q8 == 1) { ok = err(fd, "FETCH: rows are stored as f16, not as received"); break; }
+                    if (q.layer >= n_.size() || q.which > 1 || (uint64_t) q.pos0 + q.n > n_[q.layer]) {
+                        ok = err(fd, "bad FETCH: layer " + std::to_string(q.layer) + " holds " +
+                                 std::to_string(q.layer < n_.size() ? n_[q.layer] : 0) + " keys");
+                        break;
+                    }
+                    const auto & L = pages_[q.layer];
+                    std::vector<uint8_t> out((size_t) q.n * cfg_.rs);
+                    for (uint32_t done = 0; done < q.n; ) {
+                        const uint32_t pos = q.pos0 + done, pi = pos / PAGE, off = pos % PAGE;
+                        const uint32_t take = std::min(q.n - done, PAGE - off);
+                        memcpy(out.data() + (size_t) done * cfg_.rs, (q.which ? L[pi].v : L[pi].k) + (size_t) off * cfg_.rs, (size_t) take * cfg_.rs);
+                        done += take;
+                    }
+                    ok = send_msg(fd, OK, out.data(), out.size());
+                } break;
                 case ATTN: if (ane_) ane_->wake(); ok = attn(fd, buf); break;
                 case ATTN_BIG: ok = attn_big(fd, buf); break;
                 case STATS: {
@@ -701,6 +725,11 @@ public:
         return reply(OK);
     }
     bool truncate(uint32_t n) { return call(TRUNCATE, &n, 4, nullptr, 0); }
+    // v4: n rows of keys (which 0) or values (which 1) of one layer, from position pos0 of this phone's store
+    bool fetch(uint32_t layer, uint32_t pos0, uint32_t n, uint32_t which, void * out, size_t rs) {
+        fetch_req q = { layer, pos0, n, which };
+        return call(FETCH, &q, sizeof q, nullptr, 0) && take(out, (size_t) n * rs);
+    }
     // Q f16 [nkv][48][256] in, O f16 [nkv][48][256] + lse [nkv][48] out
     bool attn(uint32_t layer, uint32_t n_tok, uint32_t nk, float scale, const uint16_t * Q, size_t qn,
               uint16_t * O, float * lse, attn_rep & rep) {

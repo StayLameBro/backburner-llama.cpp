@@ -2081,7 +2081,12 @@ void llama_kv_cache::state_write(llama_io_write_i & io, llama_seq_id seq_id, lla
     }
 
     if (remote && n_remote > 0 && (seq_id == -1 || seq_id == 0)) {
-        throw std::runtime_error("phone-held KV: saving a state while the phone holds keys is not supported yet");
+        if (!remote_fetch_fn || llama_state_filter_cur().active) {
+            throw std::runtime_error(remote_fetch_fn ? "phone-held KV: a filtered state save while the phone holds keys is not supported"
+                                                     : "phone-held KV: saving a state while the phone holds keys needs a v4 phone");
+        }
+        state_write_remote(io, seq_id);
+        return;
     }
 
     GGML_UNUSED(flags);
@@ -3023,6 +3028,7 @@ int32_t llama_kv_cache::remote_attach(const char * host_port) {
     remote_append_fn   = (int (*)(int, uint32_t, uint32_t, const void *, const void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_append");
     remote_truncate_fn = (int (*)(uint32_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_truncate");
     remote_big_fn      = (int (*)(void)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_big");
+    remote_fetch_fn    = (int (*)(int, uint32_t, uint32_t, int, void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_remote_fetch");
     auto attach = (int (*)(const char *, int, const int32_t *, int, size_t, size_t, int)) fn_attach;
     if (!remote_append_fn || !remote_truncate_fn ||
         attach(host_port, (int) ils.size(), ils.data(), (int) n_head_kv, rs, ggml_row_size(t, 256), t == GGML_TYPE_Q8_0 ? 1 : t == GGML_TYPE_Q4_0 ? 2 : 0) != 0) {
@@ -3032,6 +3038,87 @@ int32_t llama_kv_cache::remote_attach(const char * host_port) {
     n_remote = 0;
     LLAMA_LOG_INFO("%s: phone-held KV attached (%s): %zu layers, %s rows of %zu bytes\n", __func__, host_port, ils.size(), ggml_type_name(t), rs);
     return 0;
+}
+
+// A state saved while the phone holds positions [0, n_remote) of sequence 0: the phone's positions come first (meta, then
+// their rows fetched back over the link, a page at a time, exactly as they were appended), then the Mac's cells as usual.
+// remote_restore_data() reads it back like any state whose oldest positions go to the phone.
+void llama_kv_cache::state_write_remote(llama_io_write_i & io, llama_seq_id seq_id) const {
+    GGML_ASSERT(n_stream == 1 && !v_trans);
+    const auto & cells = v_cells[0];
+    const uint32_t n_ph = n_remote;
+
+    // the Mac's cells of this sequence, in cell order (phone-held KV keeps one sequence, 0)
+    cell_ranges_t cr { 0, {} };
+    uint32_t n_mac = 0;
+    uint32_t begin = cells.size();
+    for (uint32_t i = 0; i < cells.size(); ++i) {
+        const bool add = !cells.is_empty(i) && (seq_id == -1 || cells.seq_has(i, seq_id));
+        if (add) {
+            ++n_mac;
+            if (begin == cells.size()) {
+                begin = i;
+            }
+        } else if (begin != cells.size()) {
+            cr.data.emplace_back(begin, i);
+            begin = cells.size();
+        }
+    }
+    if (begin != cells.size()) {
+        cr.data.emplace_back(begin, cells.size());
+    }
+
+    const uint32_t cell_count = n_ph + n_mac;
+    io.write(&n_stream, sizeof(n_stream));
+    io.write(&cell_count, sizeof(cell_count));
+
+    // meta: the phone's positions (text cells: M-RoPE positions all equal the position), then the Mac's cells
+    for (uint32_t p = 0; p < n_ph; ++p) {
+        const llama_pos pos = (llama_pos) p;
+        const uint32_t n_seq_id = 1;
+        const llama_seq_id s0 = 0;
+        io.write(&pos, sizeof(pos));
+        io.write(&n_seq_id, sizeof(n_seq_id));
+        if (has_cell_ext()) {
+            llama_kv_cell_ext ext;
+            ext.x = pos;
+            ext.y = pos;
+            io.write(&ext, sizeof(ext));
+        }
+        io.write(&s0, sizeof(s0));
+    }
+    state_write_meta(io, cr, seq_id);
+
+    // data: per layer the K rows (phone's, then the Mac's), then per layer the V rows the same way
+    const uint32_t v_trans_out = 0;
+    const uint32_t n_layer = layers.size();
+    io.write(&v_trans_out, sizeof(v_trans_out));
+    io.write(&n_layer, sizeof(n_layer));
+
+    const uint32_t chunk = 4096;
+    std::vector<uint8_t> buf;
+    for (int which = 0; which < 2; ++which) {
+        for (size_t l = 0; l < layers.size(); ++l) {
+            ggml_tensor * t = which == 0 ? layers[l].k_stream[0] : layers[l].v_stream[0];
+            const uint32_t il = layers[l].il;
+            const int32_t type_i = (int32_t) t->type;
+            const uint64_t rs = ggml_row_size(t->type, which == 0 ? hparams.n_embd_k_gqa(il) : hparams.n_embd_v_gqa(il));
+            io.write(&type_i, sizeof(type_i));
+            io.write(&rs, sizeof(rs));
+            buf.resize((size_t) chunk*rs);
+            for (uint32_t p0 = 0; p0 < n_ph; p0 += chunk) {
+                const uint32_t n = std::min(chunk, n_ph - p0);
+                if (remote_fetch_fn((int) l, p0, n, which, buf.data()) != 0) {
+                    throw std::runtime_error("phone-held KV: fetching the phone's rows for a state save failed");
+                }
+                io.write(buf.data(), (size_t) n*rs);
+            }
+            for (const auto & range : cr.data) {
+                io.write_tensor(t, range.first*rs, (range.second - range.first)*rs);
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: phone-held KV: saved %u positions, the oldest %u fetched from the phone\n", __func__, cell_count, n_ph);
 }
 
 bool llama_kv_cache::remote_truncate(llama_pos p) {

@@ -4,7 +4,7 @@
 //
 // The KV cache (libllama) owns the policy: it attaches the phone, moves old cells there (append) and truncates it.
 // It reaches these functions through ggml_backend_reg_get_proc_address(metal_reg, "<name>"):
-//   ggml_backend_metal_remote_attach, _append, _truncate, _held
+//   ggml_backend_metal_remote_attach, _append, _truncate, _held, _big, _fetch
 // and tags each attention op it owns with GGML_METAL_REMOTE_TAG in op_params[GGML_METAL_REMOTE_OP_PARAM].
 #pragma once
 
@@ -37,6 +37,10 @@ uint32_t ggml_backend_metal_remote_held(void);
 // 1 if the attached phone speaks protocol v3 (ATTN_BIG: a whole prefill ubatch per layer in one call), else 0
 typedef int      (*ggml_backend_metal_remote_big_t)(void);
 int      ggml_backend_metal_remote_big(void);
+// n rows of keys (which 0) or values (which 1) of layer i, positions [pos0, pos0 + n), exactly as appended, into out
+// (n rows of the attach row size). Needs protocol v4 on every phone; returns 0 on success
+typedef int      (*ggml_backend_metal_remote_fetch_t)(int i, uint32_t pos0, uint32_t n, int which, void * out);
+int      ggml_backend_metal_remote_fetch(int i, uint32_t pos0, uint32_t n, int which, void * out);
 
 // phone ATTN_BIG (prefill ubatch split into 8-token groups by the graph, op_params[6] = group, [7] = ubatch tokens):
 // group 0's job carries every token of the ubatch; its partials land in a big buffer that the other groups read

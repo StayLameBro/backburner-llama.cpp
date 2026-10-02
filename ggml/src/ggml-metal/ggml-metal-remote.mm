@@ -598,6 +598,30 @@ uint32_t ggml_backend_metal_remote_held(void) {
     return r_held.load();
 }
 
+int ggml_backend_metal_remote_fetch(int i, uint32_t pos0, uint32_t n, int which, void * out) {
+    std::lock_guard<std::mutex> lk(r_mu);
+    if (!r_cli || i < 0 || i >= r_nlayer || (which != 0 && which != 1) || (uint64_t) pos0 + n > r_held.load()) {
+        return 1;
+    }
+    if (r_version < 4) {
+        fprintf(stderr, "phone-kv: the phone speaks protocol v%u; saving a state while it holds keys needs v4 (rebuild the app)\n", r_version);
+        return 1;
+    }
+    // in pieces at block boundaries, each from the phone that owns the block (at that phone's own position)
+    const size_t np = n_phones();
+    for (uint32_t a = pos0; a < pos0 + n; ) {
+        const uint32_t b = np == 1 ? pos0 + n : std::min(pos0 + n, (a/r_block + 1)*r_block);
+        const size_t   p = np == 1 ? 0 : (a/r_block) % np;
+        const uint32_t lp = np == 1 ? a : local_count(p, a);
+        if (!cli(p)->fetch((uint32_t) i, lp, b - a, (uint32_t) which, (uint8_t *) out + (size_t) (a - pos0)*r_rs, r_rs)) {
+            fprintf(stderr, "phone-kv: FETCH layer %d failed on phone %zu: %s\n", i, p + 1, cli(p)->last_err.c_str());
+            return 1;
+        }
+        a = b;
+    }
+    return 0;
+}
+
 int ggml_backend_metal_remote_big(void) {
     static const int off = getenv("GGML_METAL_REMOTE_BIG") && atoi(getenv("GGML_METAL_REMOTE_BIG")) == 0;   // =0: force 8-token prefill
     return r_cli && r_version >= 3 && !off ? 1 : 0;

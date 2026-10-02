@@ -349,6 +349,7 @@ private:
     int  (*remote_append_fn)  (int, uint32_t, uint32_t, const void *, const void *) = nullptr;
     int  (*remote_truncate_fn)(uint32_t) = nullptr;
     int  (*remote_big_fn)(void) = nullptr;
+    int  (*remote_fetch_fn)(int, uint32_t, uint32_t, int, void *) = nullptr;   // v4 phones: read held rows back (state save)
 
     // drop the phone's keys at and after position p (rounded down to 64); returns false if positions had to be lost
     bool remote_truncate(llama_pos p);
@@ -388,6 +389,8 @@ private:
 
     void state_write_meta(llama_io_write_i & io, const cell_ranges_t & cr, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const;
+    // a save while the phone holds positions [0, n_remote): those rows are fetched back, the result reads like any state
+    void state_write_remote(llama_io_write_i & io, llama_seq_id seq_id) const;
 
     // sinfo_in, when set, replaces the find_slot call: the cells are given by the caller
     bool state_read_meta(llama_io_read_i & io, uint32_t strm, uint32_t cell_count,       slot_info & sinfo, llama_seq_id dest_seq_id = -1, const slot_info * sinfo_in = nullptr);

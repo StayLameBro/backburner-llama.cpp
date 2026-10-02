@@ -972,6 +972,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_metal_remote_big") == 0) {
         return (void *) ggml_backend_metal_remote_big;
     }
+    if (strcmp(name, "ggml_backend_metal_remote_fetch") == 0) {
+        return (void *) ggml_backend_metal_remote_fetch;
+    }
     if (strcmp(name, "ggml_backend_metal_tuning_device_token") == 0) {
         return (void *)ggml_backend_metal_tuning_device_token;
     }
