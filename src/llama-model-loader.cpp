@@ -1085,14 +1085,14 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force) {
+    if (mode == LLAMA_LAZY_MODE_OFF && !force) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (!force && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
@@ -1339,9 +1339,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
+    // LLAMA_LAZY_EMBD=1: the token embedding table stays in the mapped file whatever the load mode. It lives on the CPU and each
+    // token reads one row, so with --load-mode none its copy (644 MiB for a 248k vocab) is idle anonymous memory that macOS swaps
+    // out under pressure; mapped, its pages are clean (dropped for free, never swapped) and only the rows in use stay resident.
+    static const bool lazy_embd = [] { const char * e = getenv("LLAMA_LAZY_EMBD"); return e && atoi(e) != 0; }();
+    if ((flags & TENSOR_READ_LAZY) || (lazy_embd && tn.str() == "token_embd.weight")) {
         // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), !(flags & TENSOR_READ_LAZY));
     }
 
     ggml_tensor t_meta = *cur;

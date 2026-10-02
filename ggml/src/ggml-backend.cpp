@@ -26,6 +26,7 @@
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
+#include <sys/mman.h>
 #endif
 
 
@@ -1888,7 +1889,18 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_prev_graph_size = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
+#ifdef __APPLE__
+    // sized for the worst case (one split per node, 30 inputs each): ~1 GB for a 64-layer hybrid model, of which a few MB are
+    // used. From malloc, macOS charged all of it to the process as dirty memory (compressed or swapped under pressure); a fresh
+    // anonymous mapping only costs the pages that are touched.
+    {
+        void * p = mmap(NULL, sched->context_buffer_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+        sched->context_buffer = p == MAP_FAILED ? NULL : (char *) p;
+    }
+#else
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+#endif
+    GGML_ASSERT(sched->context_buffer != NULL);
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
@@ -1940,7 +1952,11 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->leaf_backend_ids);
     free(sched->prev_node_backend_ids);
     free(sched->prev_leaf_backend_ids);
+#ifdef __APPLE__
+    munmap(sched->context_buffer, sched->context_buffer_size);
+#else
     free(sched->context_buffer);
+#endif
     free(sched->graph.nodes);
     free(sched->graph.leafs);
     free(sched);

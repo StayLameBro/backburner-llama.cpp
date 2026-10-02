@@ -92,7 +92,7 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force = false);
 
         bool any() const {
             return !ranges.empty();

@@ -37,6 +37,18 @@
 #include <windows.h>
 #endif
 
+#if defined(__APPLE__)
+#include <malloc/malloc.h>
+#endif
+
+// hand freed heap memory back to the OS. macOS keeps large freed blocks (the loader's read buffers, a request's scratch) charged
+// to the process as dirty memory, which it then compresses or swaps under pressure: ~1.1 GB at load, more after each request.
+static void server_heap_trim() {
+#if defined(__APPLE__)
+    malloc_zone_pressure_relief(NULL, 0);
+#endif
+}
+
 constexpr int HTTP_POLLING_SECONDS = 1;
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -548,6 +560,8 @@ struct server_slot {
             GGML_ASSERT(task);
 
             SLT_INF(*this, "stop processing: n_tokens = %d, truncated = %d\n", prompt.n_tokens(), truncated);
+
+            server_heap_trim();
 
             t_last_used = ggml_time_us();
 
@@ -4317,7 +4331,9 @@ server_context::server_context() : impl(new server_context_impl()) {}
 server_context::~server_context() = default;
 
 bool server_context::load_model(common_params & params) {
-    return impl->load_model(params);
+    const bool ok = impl->load_model(params);
+    server_heap_trim();
+    return ok;
 }
 
 void server_context::start_loop() {
