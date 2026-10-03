@@ -40,6 +40,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -153,6 +154,31 @@ inline void tune_socket(int fd) {
     }
 }
 
+// Who may connect. The protocol has no authentication, so by default only this machine may (loopback: the e2e tests, a tail
+// on the same Mac); SPT_ALLOW_REMOTE=1 lifts that for a deliberate setup. The Backburner app replaces it with its USB-cable
+// check (set_accept_filter). Called after accept(), before anything is read; `why` says who it was and why.
+using accept_filter_fn = std::function<bool(int fd, std::string & why)>;
+inline bool accept_loopback_only(int fd, std::string & why) {
+    sockaddr_storage p = {};
+    socklen_t pl = sizeof p;
+    if (getpeername(fd, (sockaddr *) &p, &pl) != 0) { why = "no peer address"; return false; }
+    bool lo = false;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    if (p.ss_family == AF_INET) {
+        const in_addr a = ((sockaddr_in *) &p)->sin_addr;
+        lo = (ntohl(a.s_addr) >> 24) == 127;
+        inet_ntop(AF_INET, &a, ip, sizeof ip);
+    } else if (p.ss_family == AF_INET6) {
+        const in6_addr & a = ((sockaddr_in6 *) &p)->sin6_addr;
+        lo = IN6_IS_ADDR_LOOPBACK(&a) || (IN6_IS_ADDR_V4MAPPED(&a) && a.s6_addr[12] == 127);
+        inet_ntop(AF_INET6, &a, ip, sizeof ip);
+    }
+    const char * e = getenv("SPT_ALLOW_REMOTE");
+    if (lo || (e && atoi(e) != 0)) { why = std::string(ip) + (lo ? ": loopback" : ": SPT_ALLOW_REMOTE"); return true; }
+    why = std::string(ip) + ": not loopback (SPT_ALLOW_REMOTE=1 allows it)";
+    return false;
+}
+
 // ---- server ----------------------------------------------------------------------------------
 
 // Live status for a UI (the Sidecar screen). Plain fields guarded by `mu`.
@@ -177,6 +203,9 @@ public:
     // called on every HELLO once the context is ready (e.g. to switch the FFN offload on or off for the next chunks);
     // returns a note appended to the model description the client sees ("" = none)
     std::function<std::string(llama_context *, int n_layer_tail)> on_hello;
+
+    // who may connect (default: loopback only, see accept_loopback_only)
+    void set_accept_filter(accept_filter_fn f) { accept_ok_ = std::move(f); }
 
     // called before every message that runs or loads this tail's memory (SYNC, CHUNK, STATE, STATE_RANGE): lets the host make
     // room first (Sidecar unloads its ANE page models: the tail's weights are wired again by the next graph, and wired memory
@@ -233,7 +262,7 @@ public:
         return "";
     }
 
-    // Blocking accept loop on 0.0.0.0:port. Returns only on a listen error.
+    // Blocking accept loop on 0.0.0.0:port (each connection then passes the accept filter). Returns only on a listen error.
     std::string serve(int port) {
         int srv = socket(AF_INET, SOCK_STREAM, 0);
         if (srv < 0) return std::string("socket: ") + strerror(errno);
@@ -254,6 +283,14 @@ public:
             if (fd < 0) {   // a USB replug fails accept: keep listening (breaking here left the port dead until relaunch)
                 if (errno != EINTR) { log_(std::string("tail accept: ") + strerror(errno) + " (retrying)"); usleep(100000); }
                 continue;
+            }
+            {
+                std::string why;
+                if (!(accept_ok_ ? accept_ok_(fd, why) : accept_loopback_only(fd, why))) {
+                    log_("refused a connection from " + why);
+                    close(fd);
+                    continue;
+                }
             }
             tune_socket(fd);
             {
@@ -286,6 +323,7 @@ private:
     uint32_t n_valid_ = 0;            // the mirror holds positions [0, n_valid_) of the Mac's conversation
     std::vector<int32_t> taps_;
     uint32_t layer_start_ = 0, n_layer_full_ = 0;
+    accept_filter_fn accept_ok_;
     bool     no_head_ = false;        // split-gguf.py --no-head: no token_embd / output, never logits
     uint64_t file_bytes_ = 0;
     std::string desc_;
