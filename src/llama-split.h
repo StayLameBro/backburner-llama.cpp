@@ -17,6 +17,15 @@
 //
 // The mirror watermark W is lowered by the public memory/state API (seq_rm below W, seq_add/div/clear, full state set);
 // see llama_split_mem_event.
+//
+// SPLIT DECODE (env LLAMA_SPLIT_DECODE=1, with LLAMA_SPLIT_TAIL and LLAMA_SPLIT_L): for a Mac that holds only layers
+// [0, L). The context connects + HELLOs at creation (any error fails the context), and its graph is fixed to the head
+// layers [0, L). EVERY ubatch (prompt and 1-token decode alike) runs [0, L) here and is sent to the worker, which runs
+// [L, n_layer) + the output head; the worker's logits for a batch's last token land in this context's logits buffer.
+// The worker's tail state is never merged back: it is the only copy. So the worker's mirror end must equal the start of
+// each batch; a rewind (seq_rm below the end, clear, state load) resets the worker too, and decoding then has to restart
+// from position 0 (the server re-prefills). No local fallback: a worker error fails the decode (-3) and drops the link;
+// layers >= L never run here. One sequence (seq 0), outputs only on a batch's last token, no embeddings / backend samplers.
 
 #include "llama.h"
 
@@ -47,7 +56,7 @@ struct llama_split_state {
     int         port       = 50060;
     int         min_tokens = 2048;
     bool        verbose    = false;
-    bool        sd         = false;   // split decode (LLAMA_SPLIT_DECODE=1): the worker link opens at context creation
+    bool        sd         = false;   // split decode (LLAMA_SPLIT_DECODE=1): every ubatch goes to the worker
 
     std::unique_ptr<spt::tail_client> tc;
     int64_t  t_retry_us = 0;          // after a failure, reconnect no earlier than this
@@ -75,8 +84,14 @@ struct llama_split_state {
     double      push_thread_ms = 0;   // how long the thread took
     double      push_join_ms   = 0;   // how long the Mac waited for it (0 = fully hidden)
 
+    // split decode: the current call
+    llama_pos sd_D = 0;
+    int       sd_n = 0;
+    int64_t   sd_t0_us = 0;
+
     // stats
     uint64_t n_calls = 0, n_fallbacks = 0, n_tokens = 0;
+    uint64_t sd_n_resets = 0;
     double   ms_push = 0, ms_wait = 0, ms_merge = 0;
 
     ~llama_split_state();

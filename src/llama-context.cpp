@@ -1936,7 +1936,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // infernet split prefill: leading ubatches whose tail layers run on the worker (0 = none)
     int split_ub = 0;
-    if (split) {
+    // split decode: every ubatch's tail layers run on the worker (llama-split.h)
+    const bool split_sd = split && split->sd;
+    if (split_sd) {
+        if (const int rc = split_sd_begin(n_tokens_all, n_outputs_all); rc != 0) {
+            return rc;
+        }
+    } else if (split) {
         split_ub = split_begin(n_tokens_all, n_outputs_all);
         if (!split_ub) {
             split->rs_clean = false;   // this decode moves the recurrent state past the worker's copy
@@ -2062,6 +2068,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
+        if (!res && split_sd) {
+            split_sd_fail("the head pass of a ubatch failed");
+        }
+
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
             llama_pos pos_min[LLAMA_MAX_SEQ];
@@ -2185,6 +2195,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
 
+        if (split_sd && !split_sd_submit((int) n_tokens_prev, (int) ubatch.n_tokens, ubatch.pos[0], n_outputs > 0)) {
+            return -3;
+        }
+
         if (ub_i < split_ub && split->active) {
             if (!split_submit((int) n_tokens_prev, (int) ubatch.n_tokens, ubatch.pos[0])) {
                 split_abort();
@@ -2235,6 +2249,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    if (split_sd && !split_sd_finish(n_outputs_all)) {
+        return -3;
+    }
 
     if (split_ub) {
         // the head-first ubatch left the graph at layers [L, n): back to the full model

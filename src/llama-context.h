@@ -444,6 +444,10 @@ private:
     // split decode (LLAMA_SPLIT_DECODE=1, llama-split.h)
     void split_sd_init(ggml_type type_k, ggml_type type_v);
     bool split_sd_connect(std::string & err);
+    int  split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all);
+    bool split_sd_submit(int tok_off, int n_tok, llama_pos pos0, bool want_logits);
+    bool split_sd_finish(uint32_t n_outputs_all);
+    void split_sd_fail(const std::string & why);
 
     // FFN offload (set_ffn_offload)
     std::vector<llama_ffn_offload_slot> ffn_off_slots;
