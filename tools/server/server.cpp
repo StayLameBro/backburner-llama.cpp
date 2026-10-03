@@ -13,6 +13,7 @@
 #include "log.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <clocale>
 #include <exception>
 #include <signal.h>
@@ -29,8 +30,11 @@ static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice
         // this is for better developer experience, we can remove when the server is stable enough
+        // _exit, not exit: exit() isn't async-signal-safe and runs every static destructor and atexit handler, and one
+        // of those can wait forever on a thread that is itself stuck (e.g. a request waiting on a phone that stopped
+        // answering), so the second Ctrl-C never terminated anything
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
-        exit(1);
+        std::_Exit(1);
     }
 
     shutdown_handler(signal);

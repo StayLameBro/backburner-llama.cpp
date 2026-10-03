@@ -706,6 +706,8 @@ private:
 class client {
 public:
     ~client() { if (fd_ >= 0) { send_msg(fd_, BYE, nullptr, 0); ::close(fd_); } }
+    // end the connection from another thread: a send/recv blocked in it fails at once (shutdown at exit, a stalled phone)
+    void abort_io() { if (fd_ >= 0) ::shutdown(fd_, SHUT_RDWR); }
     std::string last_err;
 
     bool connect(const std::string & host, int port) {

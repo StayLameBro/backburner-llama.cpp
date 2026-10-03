@@ -18,12 +18,15 @@
 
 #include <pthread.h>
 #include <pthread/qos.h>
+#include <sys/socket.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -63,6 +66,8 @@ uint32_t local_count(size_t p, uint32_t n) {
 std::mutex              r_qmu;
 std::vector<ggml_metal_remote_job> r_q;
 pthread_once_t          r_once = PTHREAD_ONCE_INIT;
+std::atomic<bool>       r_stop{false};        // exit(): the worker leaves its loop (see stop_at_exit)
+std::atomic<bool>       r_done{false};        // the worker has left its loop
 
 uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
@@ -376,7 +381,7 @@ void * phone_thread(void *) {
     std::vector<uint16_t> Q, O;
     std::vector<float> lse;
     uint64_t t_idle = now_ns();
-    for (;;) {
+    while (!r_stop.load(std::memory_order_acquire)) {
         ggml_metal_remote_job j;
         bool have = false;
         {
@@ -418,13 +423,44 @@ void * phone_thread(void *) {
         }
         t_idle = now_ns();
     }
+    r_done.store(true, std::memory_order_release);
     return nullptr;
+}
+
+// The worker is detached and loops forever, so at exit() it could still be running while this file's statics (r_qmu, r_q,
+// the clients) are destroyed, and lock a destroyed mutex: an abort on shutdown after phone-held KV was used. Reported by
+// @dre4moff (StayLameBro/backburner discussion #6). Registered with atexit() after those statics exist, so it runs before
+// their destructors. It asks the worker to stop and waits, but never lets the phone hold up exit: a phone that went to
+// the background mid-call keeps the connection open and sends nothing, and recv() has no timeout, so a plain join would
+// hang the process forever. After a short grace period the sockets are shut down, which fails that call at once.
+bool wait_done(int ms) {
+    for (int i = 0; i < ms && !r_done.load(std::memory_order_acquire); i++) {
+        usleep(1000);
+    }
+    return r_done.load(std::memory_order_acquire);
+}
+
+void stop_at_exit() {
+    r_stop.store(true, std::memory_order_release);
+    if (wait_done(250)) {
+        return;
+    }
+    // stuck in a call to a phone: end the connections (attach() and detach run on the main thread, which is in exit())
+    for (size_t p = 0; p < n_phones(); p++) {
+        cli(p)->abort_io();
+    }
+    if (!wait_done(1000)) {
+        fprintf(stderr, "phone-kv: the phone worker did not stop at exit\n");
+    }
 }
 
 void start_thread() {
     pthread_t th;
-    pthread_create(&th, nullptr, phone_thread, nullptr);
+    if (pthread_create(&th, nullptr, phone_thread, nullptr) != 0) {
+        return;
+    }
     pthread_detach(th);
+    std::atexit(stop_at_exit);
 }
 
 } // namespace

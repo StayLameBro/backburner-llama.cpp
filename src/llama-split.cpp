@@ -116,6 +116,13 @@ void llama_context::split_init(ggml_type type_k, ggml_type type_v) {
     llama_split_register(memory.get(), split.get());
     LLAMA_LOG_WARN("%s: split prefill to %s:%d for batches >= %d tokens (LLAMA_SPLIT_TAIL)\n", __func__,
                    split->host.c_str(), split->port, split->min_tokens);
+    // the worker gets every ubatch of a batch but the last, so it never gets work when a whole batch minus one ubatch is
+    // under the minimum (e.g. -b 128 -ub 64 with the default minimum: found by @dre4moff, StayLameBro/backburner discussion #6)
+    if ((int) cparams.n_batch - (int) cparams.n_ubatch < split->min_tokens) {
+        LLAMA_LOG_WARN("%s: with -b %u and -ub %u at most %u tokens of a batch can go to the worker, under LLAMA_SPLIT_MIN=%d: "
+                       "split prefill will never run (raise -b, or lower LLAMA_SPLIT_MIN)\n", __func__,
+                       cparams.n_batch, cparams.n_ubatch, cparams.n_batch - cparams.n_ubatch, split->min_tokens);
+    }
 #else
     GGML_UNUSED(type_k); GGML_UNUSED(type_v);
 #endif
