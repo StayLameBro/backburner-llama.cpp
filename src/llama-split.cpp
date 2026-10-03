@@ -78,6 +78,54 @@ llama_split_state::~llama_split_state() {
     if (push_thread.joinable()) {
         push_thread.join();   // before tc goes away
     }
+    if (warm_thread.joinable()) {
+        { std::lock_guard<std::mutex> lk(warm_mu); warm_quit = true; }
+        warm_cv.notify_one();
+        warm_thread.join();
+    }
+}
+
+// split decode GPU warm (LLAMA_SPLIT_GPU_WARM_US). The A18 Pro GPU clocks down within a few ms of idle, and the ~160 ms per token
+// it waits for the phone is plenty: the head pass then runs at ~1.1 GHz on average instead of ~1.4. Measured (Mac head-only bench,
+// L=20 IQ2_XS, 160 ms gap per token like the phone's, 200 tokens): no warm 98-101 ms mean / 135-142 p95; a dispatch every 1 ms
+// 88.5 / 95; every 5 ms 127 / 168 (worse: the governor reads that as low load). 2026-10-03.
+static void split_warm_start(llama_split_state & st, int us) {
+    void (*warm)(void) = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count() && !warm; ++i) {
+        warm = (void (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_metal_gpu_warm");
+    }
+    if (!warm) {
+        LLAMA_LOG_WARN("%s: LLAMA_SPLIT_GPU_WARM_US needs the Metal backend: GPU warm off\n", __func__);
+        return;
+    }
+    st.warm_thread = std::thread([&st, warm, us] {
+        std::unique_lock<std::mutex> lk(st.warm_mu);
+        while (!st.warm_quit) {
+            if (!st.warm_on) {
+                st.warm_cv.wait(lk);
+                continue;
+            }
+            lk.unlock();
+            warm();
+            std::this_thread::sleep_for(std::chrono::microseconds(us));
+            lk.lock();
+        }
+    });
+    LLAMA_LOG_INFO("%s: split decode: GPU warm every %d us while the worker computes\n", __func__, us);
+}
+
+static void split_warm(llama_split_state & st, bool on) {
+    if (!st.warm_thread.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.warm_mu);
+        if (st.warm_on == on) {
+            return;
+        }
+        st.warm_on = on;
+    }
+    st.warm_cv.notify_one();
 }
 
 static double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -594,6 +642,9 @@ void llama_context::split_sd_init(ggml_type type_k, ggml_type type_v) {
         throw std::runtime_error("split decode: " + err);
     }
     llama_split_register(memory.get(), split.get());
+    if (const char * w = getenv("LLAMA_SPLIT_GPU_WARM_US"); w && atoi(w) > 0) {
+        split_warm_start(*split, atoi(w));
+    }
     // every graph of this context is the head: layers [0, L), the residual entering L read back for the worker
     cparams.layer_start = 0;
     cparams.layer_end   = (int32_t) split->L;
@@ -753,6 +804,7 @@ bool llama_context::split_sd_submit(int tok_off, int n_tok, llama_pos pos0, bool
         synchronize();
         const int n_embd = (int) model.hparams.n_embd;
         st.tc->submit_chunk(embd_layer_inp[st.L].data + (size_t) tok_off * n_embd, n_tok, n_embd, pos0, want_logits, false);
+        split_warm(st, true);
         return true;
     } catch (const std::exception & e) {
         split_sd_fail(std::string("submit: ") + e.what());
@@ -774,7 +826,9 @@ bool llama_context::split_sd_finish(uint32_t n_outputs_all) {
         std::vector<float> lg;
         std::vector<ggml_fp16_t> taps;
         std::string err;
-        if (!st.tc->finish(lg, taps, err)) {
+        const bool ok = st.tc->finish(lg, taps, err);
+        split_warm(st, false);
+        if (!ok) {
             throw std::runtime_error(err);
         }
         if (n_outputs_all == 1) {
@@ -812,6 +866,7 @@ bool llama_context::split_sd_finish(uint32_t n_outputs_all) {
 // HELLO, empty mirror) by the next batch that starts at position 0. Layers >= L never run here.
 void llama_context::split_sd_fail(const std::string & why) {
     auto & st = *split;
+    split_warm(st, false);
     LLAMA_LOG_ERROR("%s: split decode failed: %s; decode fails, worker link dropped (reconnects at the next batch from position 0)\n",
                     __func__, why.c_str());
 #ifdef LLAMA_SPLIT_HAVE_SOCKETS

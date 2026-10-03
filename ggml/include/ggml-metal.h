@@ -64,6 +64,10 @@ GGML_BACKEND_API void ggml_backend_metal_residency_prewarm(void);
 // release_now: with release on, end the residency on the next heartbeat (~5 ms) instead of after the keep-alive (e.g. the memory is
 // wanted for something else right now); the next graph requests it again
 GGML_BACKEND_API void ggml_backend_metal_residency_release_now(void);
+// infernet: one trivial 32-thread dispatch on its own queue, not waited for. Called every ~1 ms while the GPU would otherwise
+// sit idle between graphs (split decode's wait for the phone), it keeps the GPU clocked up: the A18 Pro drops its clock within
+// a few ms of idle, and the next head pass then runs at ~1.1 GHz instead of ~1.4 GHz.
+GGML_BACKEND_API void ggml_backend_metal_gpu_warm(void);
 
 #ifdef __cplusplus
 }

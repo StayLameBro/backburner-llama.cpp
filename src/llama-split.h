@@ -29,8 +29,10 @@
 
 #include "llama.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -97,6 +99,14 @@ struct llama_split_state {
     llama_pos sd_D = 0;
     int       sd_n = 0;
     int64_t   sd_t0_us = 0;
+
+    // split decode, LLAMA_SPLIT_GPU_WARM_US=N: while the worker computes a chunk, a trivial Metal dispatch every N us keeps the
+    // Mac GPU clocked up for the next head pass (warm_on between submit and the ack)
+    std::thread             warm_thread;
+    std::mutex              warm_mu;
+    std::condition_variable warm_cv;
+    bool                    warm_on   = false;
+    bool                    warm_quit = false;
 
     // stats
     uint64_t n_calls = 0, n_fallbacks = 0, n_tokens = 0;
