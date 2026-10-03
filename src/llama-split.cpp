@@ -541,10 +541,31 @@ void llama_context::split_abort() {
 
 // ---- split decode (LLAMA_SPLIT_DECODE=1): see llama-split.h ------------------------------------------------------------
 
+int32_t llama_split_decode_L(const llama_model & model, const llama_cparams & cparams) {
+    const char * sd = getenv("LLAMA_SPLIT_DECODE");
+    if (!sd || atoi(sd) == 0 || model.arch != LLM_ARCH_QWEN35 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return -1;   // the target model's own context only (not a drafter / MTP context)
+    }
+    const char * env_L = getenv("LLAMA_SPLIT_L");
+    const int L = env_L ? atoi(env_L) : 0;
+    return L > 0 && L < (int) model.hparams.n_layer() ? L : 0;
+}
+
 void llama_context::split_sd_init(ggml_type type_k, ggml_type type_v) {
 #ifdef LLAMA_SPLIT_HAVE_SOCKETS
-    // the target model's own context only (a drafter / MTP context, or common_fit's no-alloc probe, is left alone)
-    if (!memory || model.arch != LLM_ARCH_QWEN35 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.hparams.no_alloc) {
+    const int32_t L = llama_split_decode_L(model, cparams);
+    if (!memory || L < 0) {
+        return;
+    }
+    if (L == 0) {
+        throw std::runtime_error("split decode: LLAMA_SPLIT_L must be the tail's first layer, 0 < L < " +
+                                 std::to_string(model.hparams.n_layer()));
+    }
+    if (model.hparams.no_alloc) {
+        // common_fit's no-alloc probe: no link, but the same head graph (its memory has no layers >= L either)
+        cparams.layer_start = 0;
+        cparams.layer_end   = L;
+        cparams.embeddings_layer_inp[L] = true;
         return;
     }
     const char * env = getenv("LLAMA_SPLIT_TAIL");
@@ -581,7 +602,7 @@ void llama_context::split_sd_init(ggml_type type_k, ggml_type type_v) {
                    __func__, split->L, split->L, split->n_layer, split->host.c_str(), split->port);
 #else
     GGML_UNUSED(type_k); GGML_UNUSED(type_v);
-    if (getenv("LLAMA_SPLIT_TAIL")) {
+    if (memory && llama_split_decode_L(model, cparams) >= 0) {
         throw std::runtime_error("split decode (LLAMA_SPLIT_DECODE=1) needs a build with sockets");
     }
 #endif

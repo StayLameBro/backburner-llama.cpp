@@ -48,6 +48,15 @@ enum llama_split_event {
     LLAMA_SPLIT_EV_RS_DIRTY,  // the recurrent state changed (not the KV rows)
 };
 
+struct llama_model;
+struct llama_cparams;
+
+// split decode's L for a context: -1 when split decode doesn't apply to it (LLAMA_SPLIT_DECODE unset, not the qwen35 target's
+// default context), 0 when it applies but LLAMA_SPLIT_L is missing or out of range (context creation then fails), else L.
+// The memory allocates KV / recurrent state only for layers [0, L) of such a context (create_memory), and its graphs run
+// only those layers (split_sd_init).
+int32_t llama_split_decode_L(const llama_model & model, const llama_cparams & cparams);
+
 // called by the public llama_memory_* / llama_state_* entry points
 void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, llama_seq_id seq, llama_pos p0);
 
