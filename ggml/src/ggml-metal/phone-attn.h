@@ -1,8 +1,9 @@
-// COPY of infernet/phone-attn/phone-attn.h (the phone-attn protocol). Keep the two in sync; VERSION is checked at HELLO.
+// Two identical copies: backburner/phone-attn/phone-attn.h (the app, pa-tool) and llama.cpp/ggml/src/ggml-metal/phone-attn.h
+// (the Mac). Keep them identical; VERSION is checked at HELLO. tests/security/run.sh checks they match.
 
 // phone-attn.h - the phone holds the OLDEST KV pages of every full-attention layer and computes their
 // share of each attention op; the Mac merges the phone's partial with its own (log-sum-exp merge).
-// Design: docs/phone-kv-262k.md. Header-only; built into two programs:
+// Design: README.md, "Phone-held context". Header-only; built into two programs:
 //   - ios/Sidecar (RPCBridge.mm)              the real phone, port 50062
 //   - phone-attn/pa-tool.cpp (macOS)          "loopback phone" on the Mac CPU + the test client
 // Both compute with scripts/sme/sme_attn.c (SME2, 512-bit SVL: M4, A18 Pro, A19 Pro).
@@ -119,6 +120,31 @@ inline void tune_socket(int fd) {
 inline float h2f(uint16_t h) { __fp16 x; memcpy(&x, &h, 2); return (float) x; }
 inline uint16_t f2h(float f) { __fp16 x = (__fp16) f; uint16_t h; memcpy(&h, &x, 2); return h; }
 
+// Who may connect. The protocol has no authentication, so by default only this machine may (loopback: pa-tool tests);
+// PA_ALLOW_REMOTE=1 lifts that for a deliberate setup. The Backburner app replaces it with its USB-cable check
+// (set_accept_filter). Called after accept(), before anything is read; `why` says who it was and why.
+using accept_filter_fn = std::function<bool(int fd, std::string & why)>;
+inline bool accept_loopback_only(int fd, std::string & why) {
+    sockaddr_storage p = {};
+    socklen_t pl = sizeof p;
+    if (getpeername(fd, (sockaddr *) &p, &pl) != 0) { why = "no peer address"; return false; }
+    bool lo = false;
+    char ip[INET6_ADDRSTRLEN] = "?";
+    if (p.ss_family == AF_INET) {
+        const in_addr a = ((sockaddr_in *) &p)->sin_addr;
+        lo = (ntohl(a.s_addr) >> 24) == 127;
+        inet_ntop(AF_INET, &a, ip, sizeof ip);
+    } else if (p.ss_family == AF_INET6) {
+        const in6_addr & a = ((sockaddr_in6 *) &p)->sin6_addr;
+        lo = IN6_IS_ADDR_LOOPBACK(&a) || (IN6_IS_ADDR_V4MAPPED(&a) && a.s6_addr[12] == 127);
+        inet_ntop(AF_INET6, &a, ip, sizeof ip);
+    }
+    const char * e = getenv("PA_ALLOW_REMOTE");
+    if (lo || (e && atoi(e) != 0)) { why = std::string(ip) + (lo ? ": loopback" : ": PA_ALLOW_REMOTE"); return true; }
+    why = std::string(ip) + ": not loopback (PA_ALLOW_REMOTE=1 allows it)";
+    return false;
+}
+
 // ---------------------------------------------------------------- server
 struct status {
     std::mutex mu;
@@ -167,13 +193,13 @@ inline double wired_mb() {
 #endif
     return 0;
 }
-// the wired ceiling everything on the phone stays under (PA_WIRED_MAX_MB, default 9400, as scripts/serve-infernet.sh)
+// the wired ceiling everything on the phone stays under (PA_WIRED_MAX_MB, default 9400, as scripts/serve.sh)
 inline double wired_max_mb() {
     static const double v = getenv("PA_WIRED_MAX_MB") ? atof(getenv("PA_WIRED_MAX_MB")) : 9400;
     return v;
 }
 
-// optional page engine for the OLDEST keys (the Neural Engine, pa-ane.mm; docs/ane-kv-plumbing.md): each layer's keys
+// optional page engine for the OLDEST keys (the Neural Engine, pa-ane.mm; docs/ANE.md): each layer's keys
 // [p*page_keys(), (p+1)*page_keys()) become one page model once the layer holds all of them. Server-internal: the wire format
 // does not change. Builds run on the engine's own thread, never inside ATTN.
 struct page_engine {
@@ -221,6 +247,9 @@ public:
     // the rest runs on the GPU / SME at the same time (A19: ANE 0.086 ms per 1k keys vs GPU q4_0 0.150, 2026-09-27)
     void set_page_engine(page_engine * pe) { ane_ = pe; }
 
+    // who may connect (default: loopback only, see accept_loopback_only)
+    void set_accept_filter(accept_filter_fn f) { accept_ok_ = std::move(f); }
+
     // Blocking accept loop. Returns an error string if the listener fails.
     std::string serve(int port) {
         int srv = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -238,6 +267,12 @@ public:
                 if (errno != EINTR) { say(std::string("phone-attn accept: ") + strerror(errno) + " (retrying)"); ::usleep(100000); }
                 continue;
             }
+            std::string why;
+            if (!(accept_ok_ ? accept_ok_(fd, why) : accept_loopback_only(fd, why))) {
+                say("refused a connection from " + why);
+                ::close(fd);
+                continue;
+            }
             tune_socket(fd);
             session(fd);
             ::close(fd);
@@ -252,6 +287,7 @@ private:
     int n_thr_;
     engine * eng_;
     page_engine * ane_ = nullptr;
+    accept_filter_fn accept_ok_;
     config_req cfg_ = {};
     std::vector<std::vector<page>> pages_;      // per layer
     std::vector<uint32_t> n_;                   // keys held per layer
@@ -715,6 +751,7 @@ public:
         sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_port = htons((uint16_t) port);
         if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) { last_err = "bad host"; return false; }
         if (::connect(fd_, (sockaddr *) &a, sizeof a) != 0) { last_err = strerror(errno); return false; }
+        host_ = host;
         tune_socket(fd_);
         return true;
     }
@@ -754,6 +791,33 @@ public:
 
 private:
     int fd_ = -1;
+    std::string host_;
+
+    // Wait for the phone's reply. A phone can stop answering mid-call (Backburner went to the background, the screen locked,
+    // the cable came out) and keep the connection open, so a plain recv() would wait forever. On the Mac the GPU work that
+    // waits for this reply is killed by macOS after a few seconds anyway (kIOGPUCommandBufferCallbackErrorTimeout), and the
+    // server can't compute again until it restarts, so say what is going on every 5 s and give up after PA_REPLY_TIMEOUT_S
+    // seconds (default 15; 0 = wait forever).
+    bool wait_reply() {
+        static const int limit_s = getenv("PA_REPLY_TIMEOUT_S") ? atoi(getenv("PA_REPLY_TIMEOUT_S")) : 15;
+        for (int waited = 0;; ) {
+            pollfd p = { fd_, POLLIN, 0 };
+            const int r = ::poll(&p, 1, 5000);
+            if (r > 0) return true;
+            if (r < 0) {
+                if (errno == EINTR) continue;
+                last_err = strerror(errno);
+                return false;
+            }
+            waited += 5;
+            if (limit_s > 0 && waited >= limit_s) {
+                last_err = "the phone at " + host_ + " did not answer for " + std::to_string(waited) + " s";
+                return false;
+            }
+            fprintf(stderr, "phone-attn: the phone at %s hasn't answered for %d s: is Backburner open and in front on it?\n",
+                    host_.c_str(), waited);
+        }
+    }
     std::vector<uint8_t> rbuf_;
     size_t roff_ = 0;
     bool call(uint32_t type, const void * a, size_t na, const void * b, size_t nb, uint32_t want = OK) {
@@ -761,6 +825,7 @@ private:
     }
     bool reply(uint32_t want) {
         hdr h;
+        if (!wait_reply()) return false;
         if (!recv_all(fd_, &h, sizeof h) || h.magic != MAGIC) { last_err = "link closed"; return false; }
         rbuf_.resize(h.len); roff_ = 0;
         if (h.len && !recv_all(fd_, rbuf_.data(), h.len)) { last_err = "link closed"; return false; }

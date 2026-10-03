@@ -71,6 +71,19 @@ std::atomic<bool>       r_done{false};        // the worker has left its loop
 
 uint64_t now_ns() { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
 
+// A call to the phone failed (it stopped answering, or the cable came out). The phone holds the oldest part of the
+// conversation and the Mac no longer has it, so there is nothing correct to compute: never merge a missing partial
+// silently. Stop with a message that says what happened, unless the process is already exiting (stop_at_exit cut the
+// connection on purpose).
+void phone_lost() {
+    if (r_stop.load(std::memory_order_acquire)) {
+        return;
+    }
+    fprintf(stderr, "phone-kv: stopping: the phone holds the oldest part of this conversation and stopped answering, so the "
+                    "server can't continue without it. Open Backburner on the phone (keep it in front), then restart the server.\n");
+    abort();
+}
+
 // GGML_METAL_REMOTE_CHECK=1 (debug): keep a dequantized copy of what the phone holds and check each partial of KV head 0
 // against an fp64 reference computed from the f32 Q
 int check_on() {
@@ -241,7 +254,8 @@ void run_big(const ggml_metal_remote_job & j, std::vector<uint16_t> & Q, std::ve
     const uint64_t t0 = now_ns();
     std::vector<float> Of;
     if (!attn_all(true, j, (uint32_t) nt, Q, (size_t) ng*qn, O, Of, lse, rep)) {
-        abort();   // never merge a missing partial silently
+        phone_lost();
+        return;
     }
     const uint64_t t1 = now_ns();
     for (int gr = 0; gr < ng; gr++) {
@@ -317,8 +331,8 @@ void run_job(const ggml_metal_remote_job & j, std::vector<uint16_t> & Q, std::ve
     const uint64_t t0 = now_ns();
     std::vector<float> Of;
     if (!attn_all(false, j, (uint32_t) j.n_tok, Q, qn, O, Of, lse, rep)) {
-        // never merge a missing partial silently: the output would be wrong
-        abort();
+        phone_lost();
+        return;
     }
     const uint64_t t1 = now_ns();
     if (check_on() && r_more.empty()) {
