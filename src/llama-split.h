@@ -47,6 +47,7 @@ struct llama_split_state {
     int         port       = 50060;
     int         min_tokens = 2048;
     bool        verbose    = false;
+    bool        sd         = false;   // split decode (LLAMA_SPLIT_DECODE=1): the worker link opens at context creation
 
     std::unique_ptr<spt::tail_client> tc;
     int64_t  t_retry_us = 0;          // after a failure, reconnect no earlier than this

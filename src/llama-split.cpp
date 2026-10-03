@@ -99,6 +99,10 @@ static void split_push_join(llama_split_state & st) {
 
 void llama_context::split_init(ggml_type type_k, ggml_type type_v) {
 #ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    if (const char * sd = getenv("LLAMA_SPLIT_DECODE"); sd && atoi(sd) != 0) {
+        split_sd_init(type_k, type_v);
+        return;
+    }
     const char * env = getenv("LLAMA_SPLIT_TAIL");
     if (!env || !*env || !memory || model.arch != LLM_ARCH_QWEN35 || cparams.n_seq_max != 1 ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
@@ -520,4 +524,121 @@ void llama_context::split_abort() {
     st.t_retry_us = ggml_time_us() + 60 * 1000000LL;
     st.n_fallbacks++;
     st.active = false;
+}
+
+// ---- split decode (LLAMA_SPLIT_DECODE=1): see llama-split.h ------------------------------------------------------------
+
+void llama_context::split_sd_init(ggml_type type_k, ggml_type type_v) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    // the target model's own context only (a drafter / MTP context, or common_fit's no-alloc probe, is left alone)
+    if (!memory || model.arch != LLM_ARCH_QWEN35 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || model.hparams.no_alloc) {
+        return;
+    }
+    const char * env = getenv("LLAMA_SPLIT_TAIL");
+    if (!env || !*env) {
+        throw std::runtime_error("split decode (LLAMA_SPLIT_DECODE=1) needs LLAMA_SPLIT_TAIL=ip:port, the phone's tail");
+    }
+    if (cparams.n_seq_max != 1) {
+        throw std::runtime_error("split decode supports one sequence only (-np 1), this context has n_seq_max = " +
+                                 std::to_string(cparams.n_seq_max));
+    }
+    if (cparams.embeddings) {
+        throw std::runtime_error("split decode returns logits only: embeddings contexts are not supported");
+    }
+    split.reset(new llama_split_state());
+    split->sd = true;
+    std::string s = env;
+    const size_t c = s.rfind(':');
+    split->host = s.substr(0, c);
+    if (c != std::string::npos) split->port = atoi(s.c_str() + c + 1);
+    split->verbose = getenv("LLAMA_SPLIT_VERBOSE") != nullptr;
+    split_type_k = type_k;
+    split_type_v = type_v;
+    std::string err;
+    if (!split_sd_connect(err)) {
+        split.reset();
+        throw std::runtime_error("split decode: " + err);
+    }
+    llama_split_register(memory.get(), split.get());
+    LLAMA_LOG_WARN("%s: split decode: worker %s:%d connected at context creation (LLAMA_SPLIT_DECODE)\n", __func__,
+                   split->host.c_str(), split->port);
+#else
+    GGML_UNUSED(type_k); GGML_UNUSED(type_v);
+    if (getenv("LLAMA_SPLIT_TAIL")) {
+        throw std::runtime_error("split decode (LLAMA_SPLIT_DECODE=1) needs a build with sockets");
+    }
+#endif
+}
+
+// connect + HELLO; the worker must hold exactly this model's layers [LLAMA_SPLIT_L, n_layer) with the head.
+// The HELLO makes the worker (re)create its context (KV mirror at this n_ctx) and clears its mirror.
+bool llama_context::split_sd_connect(std::string & err) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    auto & st = *split;
+    try {
+        const int n_layer = (int) model.hparams.n_layer();
+        const char * env_L = getenv("LLAMA_SPLIT_L");
+        const int L = env_L ? atoi(env_L) : 0;
+        if (L <= 0 || L >= n_layer) {
+            throw std::runtime_error("LLAMA_SPLIT_L must be the tail's first layer, 0 < L < " + std::to_string(n_layer) +
+                                     " (got '" + std::string(env_L ? env_L : "") + "')");
+        }
+        for (int il = L + 1; il < (int) cparams.embeddings_layer_inp.size(); il++) {
+            if (cparams.embeddings_layer_inp[il]) {
+                throw std::runtime_error("tap layer " + std::to_string(il) + " is on the worker: not supported in split decode");
+            }
+        }
+        char desc[256];
+        llama_model_desc(&model, desc, sizeof(desc));
+        spt::hello_req2 q = {};
+        q.base.proto = spt::PROTO_VERSION; q.base.state_format = spt::STATE_FORMAT;
+        q.base.L = (uint32_t) L;
+        q.base.n_layer_full = (uint32_t) n_layer; q.base.n_embd = (uint32_t) model.hparams.n_embd;
+        q.base.n_vocab = (uint32_t) model.vocab.n_tokens(); q.base.n_ctx = cparams.n_ctx; q.base.n_ubatch = cparams.n_ubatch;
+        q.type_k = split_type_k; q.type_v = split_type_v;
+        q.flash_attn = cparams.flash_attn ? 1 : 0;
+        q.n_rs_replay = cparams.n_rs_replay;
+        q.session = (uint64_t) ggml_time_us(); q.keep = 0;
+        auto tc = std::make_unique<spt::tail_client>();
+        tc->resid_f32 = getenv("LLAMA_SPLIT_RESID_F16") == nullptr;
+        // a phone that accepts but never answers (app suspended) fails here instead of hanging the server
+        tc->recv_timeout_s = getenv("LLAMA_SPLIT_TIMEOUT_S") ? atoi(getenv("LLAMA_SPLIT_TIMEOUT_S")) : 120;
+        spt::hello_rep2 r; std::string e;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!tc->connect(st.host, st.port, q, r, e)) {
+            throw std::runtime_error(e);
+        }
+        if (r.base.layer_start != (uint32_t) L || r.base.n_layer_full != (uint32_t) n_layer || r.base.n_embd != q.base.n_embd ||
+            r.base.n_vocab != q.base.n_vocab) {
+            throw std::runtime_error("worker tail is layers [" + std::to_string(r.base.layer_start) + ", " + std::to_string(r.base.n_layer_full) +
+                                     ") n_embd " + std::to_string(r.base.n_embd) + " n_vocab " + std::to_string(r.base.n_vocab) +
+                                     ", this model wants [" + std::to_string(L) + ", " + std::to_string(n_layer) + ") n_embd " +
+                                     std::to_string(q.base.n_embd) + " n_vocab " + std::to_string(q.base.n_vocab));
+        }
+        // same quant: the worker's desc carries this model's "<ftype>" text
+        std::string mine = desc;
+        const size_t sp = mine.find(' ', mine.find(' ') + 1);
+        if (sp != std::string::npos) mine = mine.substr(sp + 1);
+        if (std::string(r.base.desc).find(mine) == std::string::npos) {
+            throw std::runtime_error(std::string("worker model '") + r.base.desc + "' is not this model's quant ('" + desc + "')");
+        }
+        if (r.n_valid != 0) {
+            throw std::runtime_error("worker kept a mirror of " + std::to_string(r.n_valid) + " tokens after a fresh HELLO");
+        }
+        st.L = (uint32_t) L; st.n_layer = (uint32_t) n_layer;
+        st.tc = std::move(tc);
+        st.W = 0;
+        LLAMA_LOG_WARN("%s: split decode: worker %s:%d = %s, layers [%u, %d) + head there, n_ctx %u, HELLO %.0f ms\n", __func__,
+                       st.host.c_str(), st.port, r.base.desc, st.L, n_layer, r.base.n_ctx, ms_since(t0));
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        st.tc.reset();
+        st.W = 0;
+        return false;
+    }
+#else
+    err = "no sockets in this build";
+    return false;
+#endif
 }
