@@ -41,6 +41,19 @@ void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, lla
         return;
     }
     llama_split_state * st = it->second;
+    if (st->sd) {
+        // split decode: the worker holds the only copy of layers >= L, which can't be rewound. Any edit below its end makes
+        // the next decode TRIM it to 0, and that decode must then start at position 0 (a full re-prefill)
+        const llama_pos W_new = ev == LLAMA_SPLIT_EV_RM ? (seq <= 0 ? std::min(st->W, std::max<llama_pos>(0, p0)) : st->W) : 0;
+        if (W_new < st->W) {
+            static const char * names[] = { "seq_rm", "clear / seq_add / seq_div / state load", "recurrent state load" };
+            LLAMA_LOG_WARN("%s: split decode: %s at position %d, the phone holds [0, %d): both sides reset, the next decode re-prefills from 0\n",
+                           __func__, names[ev], ev == LLAMA_SPLIT_EV_RM ? std::max<llama_pos>(0, p0) : 0, st->W);
+            st->W = W_new;
+            st->sd_n_resets++;
+        }
+        return;
+    }
     if (st->active) {
         return;   // our own state reads/writes during a split call
     }
@@ -65,6 +78,54 @@ llama_split_state::~llama_split_state() {
     if (push_thread.joinable()) {
         push_thread.join();   // before tc goes away
     }
+    if (warm_thread.joinable()) {
+        { std::lock_guard<std::mutex> lk(warm_mu); warm_quit = true; }
+        warm_cv.notify_one();
+        warm_thread.join();
+    }
+}
+
+// split decode GPU warm (LLAMA_SPLIT_GPU_WARM_US). The A18 Pro GPU clocks down within a few ms of idle, and the ~160 ms per token
+// it waits for the phone is plenty: the head pass then runs at ~1.1 GHz on average instead of ~1.4. Measured (Mac head-only bench,
+// L=20 IQ2_XS, 160 ms gap per token like the phone's, 200 tokens): no warm 98-101 ms mean / 135-142 p95; a dispatch every 1 ms
+// 88.5 / 95; every 5 ms 127 / 168 (worse: the governor reads that as low load). 2026-10-03.
+static void split_warm_start(llama_split_state & st, int us) {
+    void (*warm)(void) = nullptr;
+    for (size_t i = 0; i < ggml_backend_reg_count() && !warm; ++i) {
+        warm = (void (*)(void)) ggml_backend_reg_get_proc_address(ggml_backend_reg_get(i), "ggml_backend_metal_gpu_warm");
+    }
+    if (!warm) {
+        LLAMA_LOG_WARN("%s: LLAMA_SPLIT_GPU_WARM_US needs the Metal backend: GPU warm off\n", __func__);
+        return;
+    }
+    st.warm_thread = std::thread([&st, warm, us] {
+        std::unique_lock<std::mutex> lk(st.warm_mu);
+        while (!st.warm_quit) {
+            if (!st.warm_on) {
+                st.warm_cv.wait(lk);
+                continue;
+            }
+            lk.unlock();
+            warm();
+            std::this_thread::sleep_for(std::chrono::microseconds(us));
+            lk.lock();
+        }
+    });
+    LLAMA_LOG_INFO("%s: split decode: GPU warm every %d us while the worker computes\n", __func__, us);
+}
+
+static void split_warm(llama_split_state & st, bool on) {
+    if (!st.warm_thread.joinable()) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(st.warm_mu);
+        if (st.warm_on == on) {
+            return;
+        }
+        st.warm_on = on;
+    }
+    st.warm_cv.notify_one();
 }
 
 static double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -99,6 +160,10 @@ static void split_push_join(llama_split_state & st) {
 
 void llama_context::split_init(ggml_type type_k, ggml_type type_v) {
 #ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    if (const char * sd = getenv("LLAMA_SPLIT_DECODE"); sd && atoi(sd) != 0) {
+        split_sd_init(type_k, type_v);
+        return;
+    }
     const char * env = getenv("LLAMA_SPLIT_TAIL");
     if (!env || !*env || !memory || model.arch != LLM_ARCH_QWEN35 || cparams.n_seq_max != 1 ||
         cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
@@ -520,4 +585,296 @@ void llama_context::split_abort() {
     st.t_retry_us = ggml_time_us() + 60 * 1000000LL;
     st.n_fallbacks++;
     st.active = false;
+}
+
+// ---- split decode (LLAMA_SPLIT_DECODE=1): see llama-split.h ------------------------------------------------------------
+
+int32_t llama_split_decode_L(const llama_model & model, const llama_cparams & cparams) {
+    const char * sd = getenv("LLAMA_SPLIT_DECODE");
+    if (!sd || atoi(sd) == 0 || model.arch != LLM_ARCH_QWEN35 || cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {
+        return -1;   // the target model's own context only (not a drafter / MTP context)
+    }
+    const char * env_L = getenv("LLAMA_SPLIT_L");
+    const int L = env_L ? atoi(env_L) : 0;
+    return L > 0 && L < (int) model.hparams.n_layer() ? L : 0;
+}
+
+void llama_context::split_sd_init(ggml_type type_k, ggml_type type_v) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    const int32_t L = llama_split_decode_L(model, cparams);
+    if (!memory || L < 0) {
+        return;
+    }
+    if (L == 0) {
+        throw std::runtime_error("split decode: LLAMA_SPLIT_L must be the tail's first layer, 0 < L < " +
+                                 std::to_string(model.hparams.n_layer()));
+    }
+    if (model.hparams.no_alloc) {
+        // common_fit's no-alloc probe: no link, but the same head graph (its memory has no layers >= L either)
+        cparams.layer_start = 0;
+        cparams.layer_end   = L;
+        cparams.embeddings_layer_inp[L] = true;
+        return;
+    }
+    const char * env = getenv("LLAMA_SPLIT_TAIL");
+    if (!env || !*env) {
+        throw std::runtime_error("split decode (LLAMA_SPLIT_DECODE=1) needs LLAMA_SPLIT_TAIL=ip:port, the phone's tail");
+    }
+    if (cparams.n_seq_max != 1) {
+        throw std::runtime_error("split decode supports one sequence only (-np 1), this context has n_seq_max = " +
+                                 std::to_string(cparams.n_seq_max));
+    }
+    if (cparams.embeddings) {
+        throw std::runtime_error("split decode returns logits only: embeddings contexts are not supported");
+    }
+    split.reset(new llama_split_state());
+    split->sd = true;
+    std::string s = env;
+    const size_t c = s.rfind(':');
+    split->host = s.substr(0, c);
+    if (c != std::string::npos) split->port = atoi(s.c_str() + c + 1);
+    split->verbose = getenv("LLAMA_SPLIT_VERBOSE") != nullptr;
+    split_type_k = type_k;
+    split_type_v = type_v;
+    std::string err;
+    if (!split_sd_connect(err)) {
+        split.reset();
+        throw std::runtime_error("split decode: " + err);
+    }
+    llama_split_register(memory.get(), split.get());
+    if (const char * w = getenv("LLAMA_SPLIT_GPU_WARM_US"); w && atoi(w) > 0) {
+        split_warm_start(*split, atoi(w));
+    }
+    // every graph of this context is the head: layers [0, L), the residual entering L read back for the worker
+    cparams.layer_start = 0;
+    cparams.layer_end   = (int32_t) split->L;
+    cparams.embeddings_layer_inp[split->L] = true;
+    LLAMA_LOG_WARN("%s: split decode: layers [0, %u) here, [%u, %u) + output on %s:%d for every token (LLAMA_SPLIT_DECODE)\n",
+                   __func__, split->L, split->L, split->n_layer, split->host.c_str(), split->port);
+#else
+    GGML_UNUSED(type_k); GGML_UNUSED(type_v);
+    if (memory && llama_split_decode_L(model, cparams) >= 0) {
+        throw std::runtime_error("split decode (LLAMA_SPLIT_DECODE=1) needs a build with sockets");
+    }
+#endif
+}
+
+// connect + HELLO; the worker must hold exactly this model's layers [LLAMA_SPLIT_L, n_layer) with the head.
+// The HELLO makes the worker (re)create its context (KV mirror at this n_ctx) and clears its mirror.
+bool llama_context::split_sd_connect(std::string & err) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    auto & st = *split;
+    try {
+        const int n_layer = (int) model.hparams.n_layer();
+        const char * env_L = getenv("LLAMA_SPLIT_L");
+        const int L = env_L ? atoi(env_L) : 0;
+        if (L <= 0 || L >= n_layer) {
+            throw std::runtime_error("LLAMA_SPLIT_L must be the tail's first layer, 0 < L < " + std::to_string(n_layer) +
+                                     " (got '" + std::string(env_L ? env_L : "") + "')");
+        }
+        for (int il = L + 1; il < (int) cparams.embeddings_layer_inp.size(); il++) {
+            if (cparams.embeddings_layer_inp[il]) {
+                throw std::runtime_error("tap layer " + std::to_string(il) + " is on the worker: not supported in split decode");
+            }
+        }
+        char desc[256];
+        llama_model_desc(&model, desc, sizeof(desc));
+        spt::hello_req2 q = {};
+        q.base.proto = spt::PROTO_VERSION; q.base.state_format = spt::STATE_FORMAT;
+        q.base.L = (uint32_t) L;
+        q.base.n_layer_full = (uint32_t) n_layer; q.base.n_embd = (uint32_t) model.hparams.n_embd;
+        q.base.n_vocab = (uint32_t) model.vocab.n_tokens(); q.base.n_ctx = cparams.n_ctx; q.base.n_ubatch = cparams.n_ubatch;
+        q.type_k = split_type_k; q.type_v = split_type_v;
+        q.flash_attn = cparams.flash_attn ? 1 : 0;
+        q.n_rs_replay = cparams.n_rs_replay;
+        q.session = (uint64_t) ggml_time_us(); q.keep = 0;
+        auto tc = std::make_unique<spt::tail_client>();
+        tc->resid_f32 = getenv("LLAMA_SPLIT_RESID_F16") == nullptr;
+        // a phone that accepts but never answers (app suspended) fails here instead of hanging the server
+        tc->recv_timeout_s = getenv("LLAMA_SPLIT_TIMEOUT_S") ? atoi(getenv("LLAMA_SPLIT_TIMEOUT_S")) : 120;
+        spt::hello_rep2 r; std::string e;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (!tc->connect(st.host, st.port, q, r, e)) {
+            throw std::runtime_error(e);
+        }
+        if (r.base.layer_start != (uint32_t) L || r.base.n_layer_full != (uint32_t) n_layer || r.base.n_embd != q.base.n_embd ||
+            r.base.n_vocab != q.base.n_vocab) {
+            throw std::runtime_error("worker tail is layers [" + std::to_string(r.base.layer_start) + ", " + std::to_string(r.base.n_layer_full) +
+                                     ") n_embd " + std::to_string(r.base.n_embd) + " n_vocab " + std::to_string(r.base.n_vocab) +
+                                     ", this model wants [" + std::to_string(L) + ", " + std::to_string(n_layer) + ") n_embd " +
+                                     std::to_string(q.base.n_embd) + " n_vocab " + std::to_string(q.base.n_vocab));
+        }
+        // same quant: the worker's desc carries this model's "<ftype>" text
+        std::string mine = desc;
+        const size_t sp = mine.find(' ', mine.find(' ') + 1);
+        if (sp != std::string::npos) mine = mine.substr(sp + 1);
+        if (std::string(r.base.desc).find(mine) == std::string::npos) {
+            throw std::runtime_error(std::string("worker model '") + r.base.desc + "' is not this model's quant ('" + desc + "')");
+        }
+        if (r.n_valid != 0) {
+            throw std::runtime_error("worker kept a mirror of " + std::to_string(r.n_valid) + " tokens after a fresh HELLO");
+        }
+        st.L = (uint32_t) L; st.n_layer = (uint32_t) n_layer;
+        st.tc = std::move(tc);
+        st.W = 0;
+        LLAMA_LOG_WARN("%s: split decode: worker %s:%d = %s, layers [%u, %d) + head there, n_ctx %u, HELLO %.0f ms\n", __func__,
+                       st.host.c_str(), st.port, r.base.desc, st.L, n_layer, r.base.n_ctx, ms_since(t0));
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        st.tc.reset();
+        st.W = 0;
+        return false;
+    }
+#else
+    err = "no sockets in this build";
+    return false;
+#endif
+}
+
+// before the ubatch loop: check the batch is one this mode computes exactly, and that the worker's mirror ends where it starts.
+// Returns 0, or decode()'s error code (-1 invalid batch, -3 worker down / out of sync).
+int llama_context::split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    auto & st = *split;
+    const llama_batch & b = balloc->get_batch();
+    const int n = (int) n_tokens_all;
+    auto bad = [&](const std::string & why) {
+        LLAMA_LOG_ERROR("%s: split decode can't run this batch: %s\n", __func__, why.c_str());
+        return -1;
+    };
+    if (!b.token || b.embd) return bad("token batches only");
+    if (cparams.embeddings || cparams.embeddings_nextn) return bad("embeddings are not returned by the worker");
+    if (!sampling.samplers.empty()) return bad("backend samplers need the logits on this device");
+    for (int il = (int) st.L + 1; il < (int) cparams.embeddings_layer_inp.size(); il++) {
+        if (cparams.embeddings_layer_inp[il]) return bad("tap layer " + std::to_string(il) + " is on the worker");
+    }
+    for (int i = 0; i < n; i++) {
+        if (b.n_seq_id[i] != 1 || b.seq_id[i][0] != 0 || b.pos[i] != b.pos[0] + i) {
+            return bad("one sequence (seq 0) with consecutive positions only");
+        }
+    }
+    if (n_outputs_all > 1 || (n_outputs_all == 1 && !b.logits[n - 1])) {
+        return bad(std::to_string(n_outputs_all) + " outputs requested: only the batch's last token can have logits");
+    }
+    const llama_pos D = b.pos[0];
+    if (D != memory->seq_pos_max(0) + 1) {
+        return bad("batch at position " + std::to_string(D) + " is not an append (memory ends at " + std::to_string(memory->seq_pos_max(0)) + ")");
+    }
+    if (!st.tc) {
+        if (D != 0) {
+            LLAMA_LOG_ERROR("%s: split decode: the worker link is down and this batch continues at position %d: the conversation must restart from 0\n", __func__, D);
+            return -3;
+        }
+        std::string err;
+        if (!split_sd_connect(err)) {
+            LLAMA_LOG_ERROR("%s: split decode: worker reconnect failed: %s\n", __func__, err.c_str());
+            return -3;
+        }
+    }
+    try {
+        auto & tc = *st.tc;
+        if (tc.n_valid() > (uint32_t) st.W) {
+            LLAMA_LOG_WARN("%s: split decode: resetting the worker's mirror (it holds [0, %u), this context kept [0, %d))\n", __func__, tc.n_valid(), st.W);
+            tc.trim((uint32_t) st.W);   // below the end: the worker resets to 0
+        }
+        st.W = (llama_pos) tc.n_valid();
+    } catch (const std::exception & e) {
+        split_sd_fail(std::string("trim: ") + e.what());
+        return -3;
+    }
+    if (st.W != D) {
+        LLAMA_LOG_ERROR("%s: split decode: the worker holds positions [0, %d) but this batch starts at %d: re-prefill from 0 needed\n", __func__, st.W, D);
+        return -3;
+    }
+    st.sd_D = D; st.sd_n = n;
+    st.sd_t0_us = ggml_time_us();
+    return 0;
+#else
+    GGML_UNUSED(n_tokens_all); GGML_UNUSED(n_outputs_all);
+    return -3;
+#endif
+}
+
+// after a ubatch's head pass: ship its residual entering L (pipelined; the next ubatch's head pass overlaps the worker)
+bool llama_context::split_sd_submit(int tok_off, int n_tok, llama_pos pos0, bool want_logits) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    auto & st = *split;
+    try {
+        synchronize();
+        const int n_embd = (int) model.hparams.n_embd;
+        st.tc->submit_chunk(embd_layer_inp[st.L].data + (size_t) tok_off * n_embd, n_tok, n_embd, pos0, want_logits, false);
+        split_warm(st, true);
+        return true;
+    } catch (const std::exception & e) {
+        split_sd_fail(std::string("submit: ") + e.what());
+        return false;
+    }
+#else
+    GGML_UNUSED(tok_off); GGML_UNUSED(n_tok); GGML_UNUSED(pos0); GGML_UNUSED(want_logits);
+    return false;
+#endif
+}
+
+// after the ubatch loop: wait for every chunk; the output's logits row goes where a local decode would have put it (row 0:
+// the batch's only output)
+bool llama_context::split_sd_finish(uint32_t n_outputs_all) {
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    auto & st = *split;
+    try {
+        const int64_t t_sub = ggml_time_us();
+        std::vector<float> lg;
+        std::vector<ggml_fp16_t> taps;
+        std::string err;
+        const bool ok = st.tc->finish(lg, taps, err);
+        split_warm(st, false);
+        if (!ok) {
+            throw std::runtime_error(err);
+        }
+        if (n_outputs_all == 1) {
+            const size_t n_vocab = (size_t) model.vocab.n_tokens();
+            if (lg.size() != n_vocab) {
+                throw std::runtime_error("worker returned " + std::to_string(lg.size()) + " logits, want " + std::to_string(n_vocab) +
+                                         " (a head-less tail?)");
+            }
+            if (!logits.data || logits.size < n_vocab) {
+                throw std::runtime_error("no logits buffer for the output");
+            }
+            memcpy(logits.data, lg.data(), n_vocab * sizeof(float));
+        }
+        st.W = st.sd_D + st.sd_n;
+        st.n_calls++;
+        st.n_tokens += st.sd_n;
+        if (st.verbose) {
+            const auto & tm = st.tc->tail_ms;
+            LLAMA_LOG_WARN("%s: split decode %d tokens at %d: Mac %.1f ms, wait %.1f ms (phone %.1f ms last chunk), %s\n", __func__,
+                           st.sd_n, st.sd_D, (t_sub - st.sd_t0_us) / 1e3, (ggml_time_us() - t_sub) / 1e3, tm.empty() ? 0.0 : tm.back(),
+                           n_outputs_all ? "logits" : "no output");
+        }
+        return true;
+    } catch (const std::exception & e) {
+        split_sd_fail(std::string("finish: ") + e.what());
+        return false;
+    }
+#else
+    GGML_UNUSED(n_outputs_all);
+    return false;
+#endif
+}
+
+// any worker error: the decode fails (the server then clears the conversation), the link is dropped and reopened (fresh
+// HELLO, empty mirror) by the next batch that starts at position 0. Layers >= L never run here.
+void llama_context::split_sd_fail(const std::string & why) {
+    auto & st = *split;
+    split_warm(st, false);
+    LLAMA_LOG_ERROR("%s: split decode failed: %s; decode fails, worker link dropped (reconnects at the next batch from position 0)\n",
+                    __func__, why.c_str());
+#ifdef LLAMA_SPLIT_HAVE_SOCKETS
+    if (st.tc) {
+        st.tc->abort_link();
+        st.tc.reset();
+    }
+#endif
+    st.W = 0;
+    st.n_fallbacks++;
 }

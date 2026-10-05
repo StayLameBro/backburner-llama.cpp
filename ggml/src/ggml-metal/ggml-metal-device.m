@@ -1080,6 +1080,42 @@ void ggml_backend_metal_residency_prewarm(void) {
     }
 }
 
+void ggml_backend_metal_gpu_warm(void) {
+    static id<MTLCommandQueue>          queue = nil;
+    static id<MTLComputePipelineState> pso   = nil;
+    static id<MTLBuffer>               buf   = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        NSError * err = nil;
+        id<MTLLibrary> lib = [device newLibraryWithSource:
+            @"kernel void ggml_warm(device uint * x [[buffer(0)]], uint i [[thread_position_in_grid]]) { x[i] += 1u; }"
+            options:nil error:&err];
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"ggml_warm"] : nil;
+        pso = fn ? [device newComputePipelineStateWithFunction:fn error:&err] : nil;
+        [fn release];
+        [lib release];
+        if (pso) {
+            buf   = [device newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+            queue = [device newCommandQueue];
+        } else {
+            GGML_LOG_ERROR("%s: warm kernel failed: %s\n", __func__, err ? [[err description] UTF8String] : "?");
+        }
+    });
+    if (!pso) {
+        return;
+    }
+    @autoreleasepool {
+        id<MTLCommandBuffer> cmd_buf = [queue commandBufferWithUnretainedReferences];
+        id<MTLComputeCommandEncoder> enc = [cmd_buf computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:buf offset:0 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [enc endEncoding];
+        [cmd_buf commit];
+    }
+}
+
 void ggml_backend_metal_residency_release_now(void) {
     for (int i = 0; i < MIN(atomic_load(&g_rsets_n), 8); i++) {
         ggml_metal_rsets_t r = g_rsets_all[i];

@@ -17,11 +17,22 @@
 //
 // The mirror watermark W is lowered by the public memory/state API (seq_rm below W, seq_add/div/clear, full state set);
 // see llama_split_mem_event.
+//
+// SPLIT DECODE (env LLAMA_SPLIT_DECODE=1, with LLAMA_SPLIT_TAIL and LLAMA_SPLIT_L): for a Mac that holds only layers
+// [0, L). The context connects + HELLOs at creation (any error fails the context), and its graph is fixed to the head
+// layers [0, L). EVERY ubatch (prompt and 1-token decode alike) runs [0, L) here and is sent to the worker, which runs
+// [L, n_layer) + the output head; the worker's logits for a batch's last token land in this context's logits buffer.
+// The worker's tail state is never merged back: it is the only copy. So the worker's mirror end must equal the start of
+// each batch; a rewind (seq_rm below the end, clear, state load) resets the worker too, and decoding then has to restart
+// from position 0 (the server re-prefills). No local fallback: a worker error fails the decode (-3) and drops the link;
+// layers >= L never run here. One sequence (seq 0), outputs only on a batch's last token, no embeddings / backend samplers.
 
 #include "llama.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -39,6 +50,15 @@ enum llama_split_event {
     LLAMA_SPLIT_EV_RS_DIRTY,  // the recurrent state changed (not the KV rows)
 };
 
+struct llama_model;
+struct llama_cparams;
+
+// split decode's L for a context: -1 when split decode doesn't apply to it (LLAMA_SPLIT_DECODE unset, not the qwen35 target's
+// default context), 0 when it applies but LLAMA_SPLIT_L is missing or out of range (context creation then fails), else L.
+// The memory allocates KV / recurrent state only for layers [0, L) of such a context (create_memory), and its graphs run
+// only those layers (split_sd_init).
+int32_t llama_split_decode_L(const llama_model & model, const llama_cparams & cparams);
+
 // called by the public llama_memory_* / llama_state_* entry points
 void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, llama_seq_id seq, llama_pos p0);
 
@@ -47,6 +67,7 @@ struct llama_split_state {
     int         port       = 50060;
     int         min_tokens = 2048;
     bool        verbose    = false;
+    bool        sd         = false;   // split decode (LLAMA_SPLIT_DECODE=1): every ubatch goes to the worker
 
     std::unique_ptr<spt::tail_client> tc;
     int64_t  t_retry_us = 0;          // after a failure, reconnect no earlier than this
@@ -74,8 +95,22 @@ struct llama_split_state {
     double      push_thread_ms = 0;   // how long the thread took
     double      push_join_ms   = 0;   // how long the Mac waited for it (0 = fully hidden)
 
+    // split decode: the current call
+    llama_pos sd_D = 0;
+    int       sd_n = 0;
+    int64_t   sd_t0_us = 0;
+
+    // split decode, LLAMA_SPLIT_GPU_WARM_US=N: while the worker computes a chunk, a trivial Metal dispatch every N us keeps the
+    // Mac GPU clocked up for the next head pass (warm_on between submit and the ack)
+    std::thread             warm_thread;
+    std::mutex              warm_mu;
+    std::condition_variable warm_cv;
+    bool                    warm_on   = false;
+    bool                    warm_quit = false;
+
     // stats
     uint64_t n_calls = 0, n_fallbacks = 0, n_tokens = 0;
+    uint64_t sd_n_resets = 0;
     double   ms_push = 0, ms_wait = 0, ms_merge = 0;
 
     ~llama_split_state();

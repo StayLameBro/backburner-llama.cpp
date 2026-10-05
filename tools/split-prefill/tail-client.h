@@ -24,6 +24,7 @@ public:
     bool resid_f32 = false;           // f16 halves the link bytes and is token-identical; f32 is bit-exact (gates)
     std::vector<double> tail_ms;      // per chunk phone compute time
     double bytes_sent = 0;
+    int recv_timeout_s = 0;           // > 0: a reply (HELLO, ack, logits) slower than this fails the link (0 = wait forever)
 
     ~tail_client() { close_link(); }
 
@@ -35,6 +36,10 @@ public:
             a.sin_port = htons((uint16_t) port);
             if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) throw std::runtime_error("bad IPv4 address " + host);
             tune_socket(fd_);
+            if (recv_timeout_s > 0) {
+                timeval tv = { recv_timeout_s, 0 };
+                setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            }
             if (::connect(fd_, (sockaddr *) &a, sizeof(a)) != 0) {
                 throw std::runtime_error("cannot connect to tail worker at " + host + ":" + std::to_string(port) + ": " + strerror(errno));
             }
@@ -98,6 +103,13 @@ public:
         taps = std::move(taps_);
         logits_.clear(); taps_.clear();
         return true;
+    }
+
+    // drop the link now, chunks in flight or not: shutdown() wakes a reader blocked in recv
+    void abort_link() {
+        if (fd_ >= 0) shutdown(fd_, SHUT_RDWR);
+        fail("link aborted");
+        close_link();
     }
 
     std::vector<uint8_t> state_range(int p0, int p1, uint32_t flags) {

@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-split.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -2574,11 +2575,14 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
                     } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_MINIMAX_01) {
-                        filter_attn = [&](uint32_t il) {
-                            return il < hparams.n_layer() && !hparams.is_recr(il);
+                        // split decode (LLAMA_SPLIT_DECODE=1): layers >= L run on the phone, which holds their KV / state
+                        const int32_t  sd_L  = llama_split_decode_L(*this, cparams);
+                        const uint32_t n_mem = sd_L > 0 ? (uint32_t) sd_L : hparams.n_layer();
+                        filter_attn = [&, n_mem](uint32_t il) {
+                            return il < n_mem && !hparams.is_recr(il);
                         };
-                        filter_recr = [&](uint32_t il) {
-                            return il < hparams.n_layer() && hparams.is_recr(il);
+                        filter_recr = [&, n_mem](uint32_t il) {
+                            return il < n_mem && hparams.is_recr(il);
                         };
 
                         if (arch == LLM_ARCH_QWEN4EXP && hparams.indexer_head_size > 0) {
