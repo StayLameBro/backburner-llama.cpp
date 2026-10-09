@@ -110,6 +110,7 @@ inline void send_all(int fd, const void * p, size_t n) {
         ssize_t w = ::send(fd, c, n, 0);              // SO_NOSIGPIPE is set in tune_socket (macOS/iOS)
 #endif
         if (w < 0 && errno == EINTR) continue;
+        if (w < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) throw std::runtime_error("send: timed out (peer not reading)");
         if (w <= 0) throw std::runtime_error(std::string("send: ") + strerror(errno));
         c += w; n -= (size_t) w;
     }
@@ -121,6 +122,7 @@ inline void recv_all(int fd, void * p, size_t n) {
         ssize_t r = ::recv(fd, c, n, 0);
         if (r < 0 && errno == EINTR) continue;
         if (r == 0) throw std::runtime_error("connection closed");
+        if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) throw std::runtime_error("recv: timed out (peer stopped sending)");
         if (r < 0) throw std::runtime_error(std::string("recv: ") + strerror(errno));
         c += r; n -= (size_t) r;
     }

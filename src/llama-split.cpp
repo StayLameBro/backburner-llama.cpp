@@ -305,6 +305,10 @@ int llama_context::split_begin(uint32_t n_tokens_all, uint32_t n_outputs_all) {
             // error grows over the worker's layers into the DFlash tap rows (-5% drafter acceptance measured with f16).
             // LLAMA_SPLIT_RESID_F16=1 halves the link bytes (~10 ms per 512-token chunk on USB).
             tc->resid_f32 = getenv("LLAMA_SPLIT_RESID_F16") == nullptr;
+            // a phone that stops answering mid-prompt (app suspended) fails the link after this, and the batch reruns on
+            // the Mac (split_abort) instead of waiting until the app is back in front (GitHub #18, soloptimizer). Split
+            // decode keeps 120 s: there the phone holds the only copy of its layers.
+            tc->recv_timeout_s = getenv("LLAMA_SPLIT_TIMEOUT_S") ? atoi(getenv("LLAMA_SPLIT_TIMEOUT_S")) : 20;
             spt::hello_rep2 r; std::string err;
             if (!tc->connect(st.host, st.port, q, r, err)) {
                 // "tail model mismatch: phone has layers [52, 64) ...": without LLAMA_SPLIT_L, take the phone's L and retry

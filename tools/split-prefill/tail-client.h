@@ -12,6 +12,10 @@
 
 #include "tail-server.h"
 
+#include <fcntl.h>
+#include <poll.h>
+
+#include <algorithm>
 #include <condition_variable>
 #include <deque>
 #include <thread>
@@ -24,7 +28,11 @@ public:
     bool resid_f32 = false;           // f16 halves the link bytes and is token-identical; f32 is bit-exact (gates)
     std::vector<double> tail_ms;      // per chunk phone compute time
     double bytes_sent = 0;
-    int recv_timeout_s = 0;           // > 0: a reply (HELLO, ack, logits) slower than this fails the link (0 = wait forever)
+    // > 0: a send or an expected reply (ack, logits, state) stalled longer than this fails the link, so a phone that stops
+    // answering (app suspended, screen locked) can't hang the Mac (LLAMA_SPLIT_TIMEOUT_S; 0 = wait forever). Idle links never
+    // time out: the reader only waits while a chunk is in flight. The connect gives up after 5 s and the HELLO, which may
+    // (re)load the phone's model, gets 60 s.
+    int recv_timeout_s = 0;
 
     ~tail_client() { close_link(); }
 
@@ -36,17 +44,15 @@ public:
             a.sin_port = htons((uint16_t) port);
             if (inet_pton(AF_INET, host.c_str(), &a.sin_addr) != 1) throw std::runtime_error("bad IPv4 address " + host);
             tune_socket(fd_);
-            if (recv_timeout_s > 0) {
-                timeval tv = { recv_timeout_s, 0 };
-                setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            }
-            if (::connect(fd_, (sockaddr *) &a, sizeof(a)) != 0) {
+            if (recv_timeout_s > 0) set_timeouts(std::max(recv_timeout_s, 60));
+            if (!connect_timed(a, recv_timeout_s > 0 ? std::min(recv_timeout_s, 5) : 0)) {
                 throw std::runtime_error("cannot connect to tail worker at " + host + ":" + std::to_string(port) + ": " + strerror(errno));
             }
             send_msg(fd_, MSG_HELLO, &q, sizeof(q));
             const auto p = recv_reply(MSG_HELLO_OK);
             if (p.size() != sizeof(hello)) throw std::runtime_error("bad HELLO reply (phone runs protocol v1? rebuild Sidecar)");
             memcpy(&hello, p.data(), sizeof(hello));
+            if (recv_timeout_s > 0) set_timeouts(recv_timeout_s);
             rep = hello;
             n_valid_ = hello.n_valid;
             n_taps_ = q.n_taps;
@@ -145,10 +151,43 @@ private:
         if (writer_.joinable()) writer_.join();
         if (reader_.joinable()) reader_.join();
         if (fd_ >= 0) {
-            try { send_msg(fd_, MSG_BYE, nullptr, 0); } catch (...) {}
+            // no BYE on a failed link: a stalled phone with a full send buffer would hold it for another timeout
+            bool failed;
+            { std::lock_guard<std::mutex> lk(mu_); failed = !error_.empty(); }
+            if (!failed) {
+                try { send_msg(fd_, MSG_BYE, nullptr, 0); } catch (...) {}
+            }
             close(fd_);
             fd_ = -1;
         }
+    }
+
+    void set_timeouts(int s) {
+        timeval tv = { s, 0 };
+        setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    }
+
+    // connect() that gives up after timeout_s (0 = block); errno says why on failure
+    bool connect_timed(const sockaddr_in & a, int timeout_s) {
+        if (timeout_s <= 0) {
+            return ::connect(fd_, (const sockaddr *) &a, sizeof(a)) == 0;
+        }
+        const int fl = fcntl(fd_, F_GETFL, 0);
+        fcntl(fd_, F_SETFL, fl | O_NONBLOCK);
+        int e = ::connect(fd_, (const sockaddr *) &a, sizeof(a)) == 0 ? 0 : errno;
+        if (e == EINPROGRESS) {
+            pollfd pf = { fd_, POLLOUT, 0 };
+            const int pr = ::poll(&pf, 1, timeout_s * 1000);
+            e = pr == 0 ? ETIMEDOUT : pr < 0 ? errno : 0;
+            socklen_t el = sizeof(e);
+            if (pr > 0 && getsockopt(fd_, SOL_SOCKET, SO_ERROR, &e, &el) != 0) {
+                e = errno;
+            }
+        }
+        fcntl(fd_, F_SETFL, fl);
+        errno = e;
+        return e == 0;
     }
 
     void fail(const std::string & e) {
