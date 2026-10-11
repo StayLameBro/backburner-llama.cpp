@@ -1184,7 +1184,11 @@ ggml_metal_rsets_t ggml_metal_rsets_init(ggml_metal_device_t dev) {
                       [res->lock unlock];
                   }
 
-                  usleep(res->time_per_loop_ms * 1000);
+                  // idle (keep-alive over, nothing to request): check 20x less often. A phone app that sits waiting for the
+                  // Mac otherwise wakes a CPU core 200 times a second forever, which warms thin phones (backburner #1). A new
+                  // graph resets d_loop and is picked up within 100 ms; an ended residency is re-requested by the graph itself.
+                  const bool idle = atomic_load_explicit(&res->d_loop, memory_order_relaxed) <= 0;
+                  usleep((idle ? 100 : res->time_per_loop_ms) * 1000);
               }
         }
 #endif
