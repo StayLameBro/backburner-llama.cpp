@@ -22,3 +22,8 @@ endif()
 add_executable(llama-split-e2e-test split-e2e-test.cpp)
 target_link_libraries(llama-split-e2e-test PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
 target_compile_features(llama-split-e2e-test PRIVATE cxx_std_17)
+
+# gate for tail protocol v3: multi-row logits, h rows, rewind (speculative decoding across the split); see rewind-test.cpp
+add_executable(llama-split-rewind-test rewind-test.cpp)
+target_link_libraries(llama-split-rewind-test PRIVATE llama ${CMAKE_THREAD_LIBS_INIT})
+target_compile_features(llama-split-rewind-test PRIVATE cxx_std_17)

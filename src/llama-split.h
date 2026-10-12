@@ -26,6 +26,14 @@
 // each batch; a rewind (seq_rm below the end, clear, state load) resets the worker too, and decoding then has to restart
 // from position 0 (the server re-prefills). No local fallback: a worker error fails the decode (-3) and drops the link;
 // layers >= L never run here. One sequence (seq 0), outputs only on a batch's last token, no embeddings / backend samplers.
+//
+// SPLIT DECODE WITH A v3 WORKER (tail protocol v3, the worker's HELLO_OK says proto >= 3): speculative decoding works across
+// the split. A batch may ask for logits on any of its tokens (the worker returns every row of each chunk that has an output;
+// the flagged rows land in this context's logits buffer in batch order), embeddings_nextn (unmasked) is filled from the
+// worker's h_nextn rows (the MTP draft head then runs here on the Mac, see common/speculative.cpp draft-mtp), and a seq_rm
+// into the last batch, no deeper than that batch and n_rs_replay - 1 tokens, rewinds the worker too (the next chunk carries
+// CB_REWIND; both sides roll back with the GDN replay log) instead of resetting it. With a v2 worker all of that is refused
+// as before, so speculation stays off (serve.sh) and nothing changes.
 
 #include "llama.h"
 
@@ -99,6 +107,15 @@ struct llama_split_state {
     llama_pos sd_D = 0;
     int       sd_n = 0;
     int64_t   sd_t0_us = 0;
+    std::vector<std::pair<int, int>> sd_chunks;   // (token offset, n_tokens) of the call's chunks that asked for every row's logits
+    bool      sd_multi = false;       // v3: this call's outputs aren't just its last token: every chunk with one uses CB_ALL_LOGITS
+
+    // split decode with a v3 worker
+    bool      sd_v3 = false;          // the worker's HELLO_OK said proto >= 3
+    uint32_t  sd_replay = 0;          // this context's n_rs_replay (the worker's tail context has the same, from the HELLO)
+    int       sd_last_n = 0;          // tokens of the last chunk sent (a rewind may cut only into those: the replay log)
+    bool      sd_rewind = false;      // W was lowered by a seq_rm the worker can follow: the next chunk carries CB_REWIND
+    uint64_t  sd_n_rewinds = 0;
 
     // split decode, LLAMA_SPLIT_GPU_WARM_US=N: while the worker computes a chunk, a trivial Metal dispatch every N us keeps the
     // Mac GPU clocked up for the next head pass (warm_on between submit and the ack)

@@ -623,7 +623,7 @@ int main(int argc, char ** argv) {
     std::unique_ptr<tail_runner> tail;
     if (remote) {
         spt::hello_req q = {};
-        q.proto = spt::PROTO_VERSION; q.state_format = spt::STATE_FORMAT;
+        q.proto = spt::PROTO_HELLO; q.state_format = spt::STATE_FORMAT;
         q.L = (uint32_t) a.Ls[0]; q.n_layer_full = (uint32_t) n_layer;
         q.n_embd = (uint32_t) n_embd; q.n_vocab = (uint32_t) n_vocab;
         q.n_ctx = (uint32_t) a.n_ctx; q.n_ubatch = (uint32_t) a.n_ub;
