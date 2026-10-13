@@ -441,6 +441,7 @@ private:
     bool split_skip_apply = false;       // the tail pass of a head-first ubatch reuses the head pass's memory slot
     std::vector<float> split_resid;      // the residual entering L of the head-first ubatch
     void split_abort();
+    void split_unwind();
     // split decode (LLAMA_SPLIT_DECODE=1, llama-split.h)
     void split_sd_init(ggml_type type_k, ggml_type type_v);
     bool split_sd_connect(std::string & err);

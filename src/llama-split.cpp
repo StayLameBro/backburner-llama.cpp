@@ -17,6 +17,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <mutex>
@@ -27,11 +28,28 @@ static std::map<const llama_memory_i *, llama_split_state *> g_split_reg;
 void llama_split_register(const llama_memory_i * mem, llama_split_state * st) {
     std::lock_guard<std::mutex> lk(g_split_mu);
     g_split_reg[mem] = st;
+    st->reg_mem = mem;
 }
 
 void llama_split_unregister(const llama_memory_i * mem) {
     std::lock_guard<std::mutex> lk(g_split_mu);
     g_split_reg.erase(mem);
+}
+
+size_t llama_split_n_registered(void) {
+    std::lock_guard<std::mutex> lk(g_split_mu);
+    return g_split_reg.size();
+}
+
+static std::atomic<int32_t> g_split_test_fault { 0 };
+
+void llama_split_test_fault(int32_t kind) {
+    g_split_test_fault = kind;
+}
+
+bool llama_split_take_test_fault(int32_t kind) {
+    int32_t k = kind;
+    return g_split_test_fault.load(std::memory_order_relaxed) == kind && g_split_test_fault.compare_exchange_strong(k, 0);
 }
 
 void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, llama_seq_id seq, llama_pos p0) {
@@ -75,6 +93,13 @@ void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, lla
 }
 
 llama_split_state::~llama_split_state() {
+    if (reg_mem) {   // only this state's own entry: the memory's address may already be registered to a newer state
+        std::lock_guard<std::mutex> lk(g_split_mu);
+        auto it = g_split_reg.find(reg_mem);
+        if (it != g_split_reg.end() && it->second == this) {
+            g_split_reg.erase(it);
+        }
+    }
     if (push_thread.joinable()) {
         push_thread.join();   // before tc goes away
     }
@@ -589,6 +614,24 @@ void llama_context::split_abort() {
     st.t_retry_us = ggml_time_us() + 60 * 1000000LL;
     st.n_fallbacks++;
     st.active = false;
+}
+
+// decode() returned while a split prefill was under way (an early return, a failed ubatch, an exception): undo the split
+// so the next decode doesn't run on the head-only graph (backburner-llama.cpp#4). After a finished or aborted split it
+// only puts back a graph range that decode() hadn't restored yet.
+void llama_context::split_unwind() {
+    if (!split) {
+        return;
+    }
+    try {
+        if (split->active) {
+            split_abort();
+        } else if (cparams.layer_end >= 0 || cparams.layer_start != 0) {
+            split_restore_graph();
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: %s\n", __func__, e.what());
+    }
 }
 
 // ---- split decode (LLAMA_SPLIT_DECODE=1): see llama-split.h ------------------------------------------------------------

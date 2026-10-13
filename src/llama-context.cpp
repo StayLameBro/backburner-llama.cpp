@@ -428,6 +428,9 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         split_init(params.type_k, params.type_v);
+        if (split && llama_split_take_test_fault(2)) {
+            throw std::runtime_error("split test fault right after split_init");
+        }
         // FFN offload slots exist from the start (all off), so graphs of a GGUF without FFN weights can be reserved
         set_ffn_offload(0, 0, nullptr, nullptr);
     }
@@ -1947,6 +1950,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         if (!split_ub) {
             split->rs_clean = false;   // this decode moves the recurrent state past the worker's copy
         }
+    }
+    // every return from here on (errors included) leaves the full graph and no half-done split behind
+    struct split_unwind_guard {
+        llama_context * ctx;
+        ~split_unwind_guard() { if (ctx) ctx->split_unwind(); }
+    } split_guard { split_ub > 0 ? this : nullptr };
+    if (split_ub > 0 && llama_split_take_test_fault(1)) {
+        return -2;
     }
     int ub_i = 0;
 
