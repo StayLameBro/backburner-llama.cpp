@@ -3423,6 +3423,7 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
 // ref: https://github.com/ggml-org/llama.cpp/pull/27390
 // dequantize the quantized KV cache to F16 before running the F16 flash attention kernels
 static int ggml_metal_op_flash_attn_ext_prefill_gqa(const ggml_tensor * op);
+static int ggml_metal_op_flash_attn_ext_prefill_gqa_nwg(const ggml_tensor * op);
 
 static bool ggml_metal_op_flash_attn_ext_use_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
@@ -3733,6 +3734,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
         res += ggml_type_size(GGML_TYPE_F32)*(ne01_max*ne02*ne03*nwg*(ne20 + 2));
     }
 
+    // the GQA prefill's split over the keys: partials for every row of the ubatch
+    if (const int nwg_p = ggml_metal_op_flash_attn_ext_prefill_gqa_nwg(op); nwg_p > 1) {
+        res = std::max<size_t>(res, ggml_type_size(GGML_TYPE_F32)*((size_t) ne01*ne02*ne03*nwg_p*(ne20 + 2)));
+    }
+
     return res;
 }
 
@@ -3848,6 +3854,23 @@ static int ggml_metal_op_flash_attn_ext_prefill_gqa(const ggml_tensor * op) {
     }
 
     return ntok;
+}
+
+// GQA prefill split over the keys: one threadgroup per (token tile, KV head) walked every key of the context, so at 16k+
+// keys each ran a long time on a small GPU, and an M1 iPad's command buffers failed there (status 5, backburner #30).
+// GGML_METAL_FA_PREFILL_GQA_KPW = most keys per threadgroup (default 4096; 0 = one threadgroup walks them all): the keys
+// are split over up to 8 threadgroups, whose partials the vec reduce kernel merges, as in the verify path.
+static int ggml_metal_op_flash_attn_ext_prefill_gqa_nwg(const ggml_tensor * op) {
+    static int kpw = -1;
+    if (kpw < 0) {
+        const char * s = getenv("GGML_METAL_FA_PREFILL_GQA_KPW");
+        kpw = s ? std::max(0, atoi(s)) : 4096;
+    }
+    const int64_t ne11 = op->src[1]->ne[1];
+    if (kpw == 0 || ne11 <= kpw || ggml_metal_op_flash_attn_ext_prefill_gqa(op) == 0) {
+        return 1;
+    }
+    return (int) std::min<int64_t>(8, (ne11 + kpw - 1)/kpw);
 }
 
 // Prefill FA on the matrix units (GGML_METAL_FA_PREFILL_NA=1, tensor API devices: A19, M5). K/V f16 in device memory
@@ -4186,7 +4209,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         const int32_t G    = ne02/ne12;
         const int32_t nsg  = std::max(4, (G*ntok + 7)/8);
         const int32_t ntl  = (ne01 + ntok - 1)/ntok;
-        const int32_t nwg  = 1;
+        const int32_t nwg  = ggml_metal_op_flash_attn_ext_prefill_gqa_nwg(op);
 
         if (has_mask) {
             ggml_metal_kargs_flash_attn_ext_blk args0 = {
@@ -4218,8 +4241,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
-                GGML_LOG_INFO("%s: FA GQA prefill kernel engaged: G = %d, ne01 = %d, ne11 = %d, ntok = %d, nsg = %d\n",
-                        __func__, G, (int) ne01, (int) ne11, ntok, nsg);
+                GGML_LOG_INFO("%s: FA GQA prefill kernel engaged: G = %d, ne01 = %d, ne11 = %d, ntok = %d, nsg = %d, nwg = %d\n",
+                        __func__, G, (int) ne01, (int) ne11, ntok, nsg, nwg);
             }
         }
 
@@ -4274,12 +4297,29 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
         ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
-        ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
+        ggml_metal_encoder_set_buffer  (enc, nwg > 1 ? bid_tmp : bid_dst, 5);
         ggml_metal_encoder_set_buffer  (enc, bid_blk,  6);
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
         ggml_metal_encoder_dispatch_threadgroups(enc, ntl*nwg, ne12, ne03, 32*nsg, 1, 1);
+
+        if (nwg > 1) {
+            // merge each row's nwg partials
+            const int32_t nrows = ne1*ne2*ne3;
+            GGML_ASSERT(sizeof(float)*(size_t) nrows*nwg*(ne20 + 2) <= ggml_metal_op_flash_attn_ext_extra_tmp(op));
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
+                nrows,
+            };
+            ggml_metal_encoder_set_pipeline(enc, ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg));
+            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+        }
 
         return 1;
     }
