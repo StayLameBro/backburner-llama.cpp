@@ -125,6 +125,12 @@ LLAMA_API bool llama_ffn_offload_failed(struct llama_context * ctx);
 LLAMA_API void llama_state_filter_set(int32_t p0, int32_t p1, int32_t il0, int32_t il1, int32_t kv_mode, int32_t rs_mode, bool kv, bool rs);
 LLAMA_API void llama_state_filter_clear(void);
 
+// split prefill tests only (llama-split-e2e-test --faults): 1 = the next split prefill fails right after it began, the way
+// an allocation failure would; 2 = the next context that sets up split prefill throws right after split_init
+LLAMA_API void   llama_split_test_fault(int32_t kind);
+// contexts registered for split prefill / split decode right now
+LLAMA_API size_t llama_split_n_registered(void);
+
 // mirrors:
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);

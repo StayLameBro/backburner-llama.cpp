@@ -1,7 +1,7 @@
 // split-e2e-test: end-to-end gate for split prefill INSIDE llama_decode (src/llama-split.cpp, env LLAMA_SPLIT_TAIL).
 //
 //   LLAMA_SPLIT_L=20 llama-split-e2e-test -m model.gguf -f text.txt --tail HOST:PORT [--min 1024 --view 2048 --ub 512
-//                                          --taps 21,27 -ngl 99 --kv q8_0 --replay 8]
+//                                          --taps 21,27 -ngl 99 --kv q8_0 --replay 8 --faults]
 //
 // Two contexts on one model: R (plain) and S (created with LLAMA_SPLIT_TAIL set, so its big prompt views go to the
 // worker). Both run the same server-like conversation through plain llama_decode calls, in views of --view tokens:
@@ -11,6 +11,8 @@
 //   4. greedy 16
 // Pass = identical greedy tokens at every step. Also reports the max |diff| of the tap layer rows (DFlash reads these)
 // between R and S on the split views, and the split counters from the log (LLAMA_SPLIT_VERBOSE=1 prints them).
+// --faults adds, after step 2: a split prefill on S that fails right after it began (backburner-llama.cpp#4: S must stay on
+// the full graph, so steps 3-7 still match R), and a split context whose constructor throws (#5: no registry entry left).
 #include "llama.h"
 #include "../../src/llama-ext.h"
 
@@ -29,7 +31,7 @@ static int argmax(const float * v, int n) { return (int) (std::max_element(v, v 
 int main(int argc, char ** argv) {
     std::string model_path, text_path, tail, kv;
     int min_tok = 1024, view = 2048, ub = 512, ngl = 99, replay = 0;
-    bool quick = false;   // --quick: one 2-view prompt + greedy 16 (timing + a token check in ~1 min on the 27B)
+    bool quick = false, faults = false;   // --quick: one 2-view prompt + greedy 16 (timing + a token check in ~1 min on the 27B)
     std::vector<int> taps;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
@@ -44,6 +46,7 @@ int main(int argc, char ** argv) {
         else if (s == "--kv") kv = nx();
         else if (s == "--replay") replay = std::stoi(nx());
         else if (s == "--quick") quick = true;
+        else if (s == "--faults") faults = true;
         else if (s == "--taps") { std::stringstream t(nx()); std::string x; while (std::getline(t, x, ',')) taps.push_back(std::stoi(x)); }
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
@@ -137,6 +140,31 @@ int main(int argc, char ** argv) {
         return fails ? 1 : 0;
     }
     prompt(A);  greedy(16);
+    if (faults) {
+        // a split prefill of one view that fails right after it began: S must be back at pos on the full graph
+        const int n = view;
+        llama_batch b = llama_batch_init(n, 0, 1);
+        for (int i = 0; i < n; i++) { b.token[i] = Dd[i % Dd.size()]; b.pos[i] = pos + i; b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = i == n - 1; }
+        b.n_tokens = n;
+        llama_split_test_fault(1);
+        const int rc = llama_decode(S, b);
+        llama_split_test_fault(0);
+        llama_batch_free(b);
+        const llama_pos pm = llama_memory_seq_pos_max(llama_get_memory(S), 0);
+        printf("fault: failed split prefill rc=%d, S at pos %d (want %d)\n", rc, pm + 1, pos);
+        fails += rc == 0 || pm + 1 != pos;
+        // a split context whose constructor throws after split_init leaves no registry entry
+        const size_t reg0 = llama_split_n_registered();
+        setenv("LLAMA_SPLIT_TAIL", tail.c_str(), 1);
+        llama_split_test_fault(2);
+        llama_context * X = llama_init_from_model(model, cp);
+        llama_split_test_fault(0);
+        unsetenv("LLAMA_SPLIT_TAIL");
+        const size_t reg1 = llama_split_n_registered();
+        printf("fault: context constructor threw: %s, registered contexts %zu -> %zu\n", X ? "no" : "yes", reg0, reg1);
+        fails += X != nullptr || reg1 != reg0;
+        if (X) llama_free(X);
+    }
     prompt(B);  greedy(16);
     // checkpoint at p_edit the way the server makes one: the partial (recurrent) state
     const llama_pos p_edit = pos;
