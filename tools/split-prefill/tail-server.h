@@ -277,14 +277,6 @@ public:
 
     // Blocking accept loop on 0.0.0.0:port (each connection then passes the accept filter). Returns only on a listen error.
     std::string serve(int port) {
-        // The Mac sends its replay depth (--spec-gdn-replay) in HELLO and the tail builds its context with it. LLAMA_GDN_REPLAY in
-        // this process (env.txt on a phone) would override that inside llama_init_from_model and break split prefill's state push
-        // and MTP rewinds, with nothing it could make better, so drop it here, before the first HELLO. serve() can run again
-        // (the app restarts it after an error); the second time there is nothing to drop
-        if (const char * e = getenv("LLAMA_GDN_REPLAY")) {
-            log_(std::string("LLAMA_GDN_REPLAY=") + e + " ignored: the tail takes the replay depth from the Mac's HELLO");
-            unsetenv("LLAMA_GDN_REPLAY");
-        }
         int srv = socket(AF_INET, SOCK_STREAM, 0);
         if (srv < 0) return std::string("socket: ") + strerror(errno);
         int one = 1;
@@ -396,7 +388,13 @@ private:
                     cp.n_ctx = q.n_ctx; cp.n_batch = q.n_ubatch; cp.n_ubatch = q.n_ubatch;
                     cp.n_seq_max = 1; cp.no_perf = true;
                     cp.type_k = (ggml_type) q2.type_k; cp.type_v = (ggml_type) q2.type_v;
-                    cp.n_rs_replay = q2.n_rs_replay;
+                    // the depth comes from the Mac. A Mac at 0 sends 0, mapped to UINT32_MAX (off): LLAMA_GDN_REPLAY in this
+                    // process can't turn it on, so both sides stay at 0
+                    cp.n_rs_replay = q2.n_rs_replay ? q2.n_rs_replay : UINT32_MAX;
+                    const char * e = getenv("LLAMA_GDN_REPLAY");
+                    if (e && (uint32_t) atoi(e) != q2.n_rs_replay) {
+                        log_(std::string("LLAMA_GDN_REPLAY=") + e + " ignored: the tail takes the replay depth from the Mac's HELLO");
+                    }
                     if (q2.flash_attn) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                     ctx_ = llama_init_from_model(model_, cp);
                     h_rows_on_ = false;
@@ -404,9 +402,8 @@ private:
                     else { ctx_n_ctx_ = q.n_ctx; ctx_n_ub_ = q.n_ubatch; ctx_type_k_ = q2.type_k; ctx_type_v_ = q2.type_v;
                            ctx_fa_ = q2.flash_attn; ctx_replay_ = q2.n_rs_replay; }
                     // the replay depth must be the Mac's: a rewind and split prefill's recurrent-state push (its row layout
-                    // depends on the depth) need it; plain split decode sends neither SYNC nor (at Mac replay 0) a rewind.
-                    // serve() drops LLAMA_GDN_REPLAY, so this is a backstop for a depth that differs anyway: the session is
-                    // refused below (the CB_REWIND / SYNC checks stay as a second line). Checked for a Mac at 0 too
+                    // depends on the depth) need it. Backstop: a depth that differs anyway is refused below (the CB_REWIND /
+                    // SYNC checks stay as a second line). Checked for a Mac at 0 too
                     replay_mismatch_.clear();
                     if (ctx_) {
                         const uint32_t eff = llama_n_rs_seq(ctx_) > 0 ? llama_n_rs_seq(ctx_) + 1 : 0;
@@ -416,8 +413,8 @@ private:
                         }
                     }
                 }
-                // backstop: serve() dropped LLAMA_GDN_REPLAY, so a mismatch here means the context changed the depth by
-                // itself. Refuse at connect rather than at the first SYNC or rewind
+                // backstop: a mismatch here means the context changed the depth by itself. Refuse at connect rather than at
+                // the first SYNC or rewind
                 if (err.empty() && !replay_mismatch_.empty()) err = replay_mismatch_;
                 if (!err.empty()) { status("error", err); send_err(fd, err); return; }
                 // the mirror survives a reconnect only for the same session with the same settings

@@ -1,19 +1,31 @@
 // rewind-test: gate for tail protocol v3 (tail-server.h CB_ALL_LOGITS / CB_H_ROWS / CB_REWIND), the phone half of
 // speculative decoding across the split. No Mac head needed: the residuals are synthetic rows, so any tail GGUF works.
 //
-//   llama-split-rewind-test --tail-model tail.gguf [--replay 9] [--k 7] [--prompt 100] [--ub 64] [--port 50071]
+//   llama-split-rewind-test --tail-model tail.gguf [--replay 9] [--k 7] [--prompt 100] [--ub 64] [--port 50071] [--exact]
 //
-// Runs a tail_server on loopback in this process and drives it with tail_client. For every rejected depth r = 1..k:
-//   X: HELLO, prompt [0, P) in ubatch chunks, a verify chunk of k+1 rows at P (the last r rows are "rejected" residuals),
-//      then a chunk of m rows at P + (k+1-r) with CB_REWIND
-//   Y: HELLO, the same prompt, a chunk of the k+1-r accepted rows at P, then the same m rows
-// Pass = X's and Y's last-chunk logits and h rows are bit-identical (memcmp), for every r. Also checks:
+// Runs a tail_server on loopback in this process and drives it with tail_client. Two speculative rounds back to back, as
+// the MTP loop sends them, for every round-1 depth r = 0..k (r2 = (r + 1) % (k + 1) in round 2):
+//   X:  prompt [0, P), a verify chunk of k+1 rows at P (the last r rows rejected), a verify chunk of k+1 rows with
+//       CB_REWIND (the last r2 rows rejected), then 2 rows with CB_REWIND
+//   X2: X with other rejected rows
+//   Z:  every kept row in the prompt (its last ubatch > replay rows: eager, no replay log), then the same 2 rows
+// Pass, for every r:
+//   - X vs X2 bit-identical (round-2 kept rows and the last 2 rows, logits and h): no trace of the rejected rows. Any backend
+//   - with --exact, X vs Z bit-identical on the last 2 rows: the replay gives what a plain decode gives. Without --exact
+//     INFO only: the matmul kernel can change with the batch shape. --exact needs a build where it can't, e.g.
+//     -DGGML_METAL=OFF -DGGML_BLAS=OFF -DGGML_CPU_REPACK=OFF -DGGML_LLAMAFILE=OFF -DGGML_CPU_KLEIDIAI=OFF, and on ARM
+//     -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 (no i8mm). It sets LLAMA_GDN_PREP_FUSE=0: the fused
+//     GDN prep is not bit-identical to the unfused one that Z's eager ubatch builds
+// Also checks:
 //   - a v2-style chunk (bits 1 only) still returns one logits row and no h rows
 //   - a rewind deeper than the last chunk is refused with ERR (and the link then fails: the Mac would re-prefill)
 //   - the all-rows logits of a verify chunk: row k equals the single-row logits of the same chunk (CB_LOGITS) bit-exact
 #include "tail-client.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <cstdio>
 #include <random>
 #include <string>
@@ -60,6 +72,7 @@ struct sess {
 int main(int argc, char ** argv) {
     std::string tail_model;
     int replay = 9, k = 7, P = 100, ub = 64, port = 50071;
+    bool exact = false;
     for (int i = 1; i < argc; i++) {
         std::string s = argv[i];
         auto nx = [&]() { return std::string(argv[++i]); };
@@ -69,11 +82,13 @@ int main(int argc, char ** argv) {
         else if (s == "--prompt") P = std::stoi(nx());
         else if (s == "--ub") ub = std::stoi(nx());
         else if (s == "--port") port = std::stoi(nx());
+        else if (s == "--exact") exact = true;
         else { fprintf(stderr, "unknown arg %s\n", s.c_str()); return 2; }
     }
     if (tail_model.empty()) { fprintf(stderr, "need --tail-model\n"); return 2; }
     if (k + 1 > replay) { fprintf(stderr, "k+1 (%d) must be <= --replay (%d): the verify chunk has to stay in the replay log\n", k + 1, replay); return 2; }
 
+    if (exact) setenv("LLAMA_GDN_PREP_FUSE", "0", 1);   // before any graph is built; one thread so far
     llama_backend_init();
     llama_log_set([](ggml_log_level lvl, const char * t, void *) { if (lvl >= GGML_LOG_LEVEL_WARN) fputs(t, stderr); }, nullptr);
 
@@ -141,56 +156,67 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // rewind equivalence for every depth
-    for (int r = 1; r <= k; r++) {
-        const int a = k + 1 - r, m = 3;
-        std::vector<float> lgV, lgX, lgY; std::vector<ggml_fp16_t> hV, hX, hY;
-        bool ok = true;
-        {
-        sess X;
-        if (!X.open(port, q, err) || !X.prompt(P, ub, err)) { check(false, "X prompt: " + err); continue; }
-        // verify chunk: a accepted rows (variant 0), r rejected rows (variant 1)
-        auto acc = rows(P, a, n_embd, 0), rej = rows(P + a, r, n_embd, 1);
-        std::vector<float> ver(acc); ver.insert(ver.end(), rej.begin(), rej.end());
-        try { X.tc.submit_chunk_v3(ver.data(), k + 1, n_embd, P, spt::CB_ALL_LOGITS | spt::CB_H_ROWS); } catch (const std::exception & e) { ok = false; err = e.what(); }
-        { std::vector<ggml_fp16_t> t; ok = ok && X.tc.finish_v3(lgV, t, hV, err); }
-        ok = ok && X.chunk(P + a, m, 0, spt::CB_ALL_LOGITS | spt::CB_H_ROWS | spt::CB_REWIND, lgX, hX, err);
-        if (!ok) { check(false, "r=" + std::to_string(r) + " X: " + err); continue; }
-        }
-        std::vector<float> lgYa; std::vector<ggml_fp16_t> hYa;
-        {
-        sess Y;
-        ok = Y.open(port, q, err) && Y.prompt(P, ub, err);
-        ok = ok && Y.chunk(P, a, 0, spt::CB_ALL_LOGITS | spt::CB_H_ROWS, lgY, hY, err);
-        lgYa = lgY; hYa = hY;
-        ok = ok && Y.chunk(P + a, m, 0, spt::CB_ALL_LOGITS | spt::CB_H_ROWS, lgY, hY, err);
-        if (!ok) { check(false, "r=" + std::to_string(r) + " Y: " + err); continue; }
-        }
+    // rewind equivalence: two speculative rounds back to back
+    const uint32_t ALL = spt::CB_ALL_LOGITS | spt::CB_H_ROWS;
+    const int nf = 2;   // rows after the last rewind
+    for (int r = 0; r <= k; r++) {
+        const int r2 = (r + 1) % (k + 1);
+        const int a = k + 1 - r, a2 = k + 1 - r2;   // kept rows per round
+        const std::string tag = "r=" + std::to_string(r) + "," + std::to_string(r2) + " (keep " + std::to_string(a) + "+" + std::to_string(a2) + ")";
+        // out: the round-2 kept rows, then the nf rows (logits, h)
+        auto run_x = [&](int rv, std::vector<float> & lg, std::vector<ggml_fp16_t> & h) {
+            sess X;
+            if (!X.open(port, q, err) || !X.prompt(P, ub, err)) return false;
+            auto verify = [&](int p0, int na, int nr, uint32_t bits, std::vector<float> & l, std::vector<ggml_fp16_t> & hh) {
+                auto x = rows(p0, na, n_embd, 0), rej = rows(p0 + na, nr, n_embd, rv);
+                x.insert(x.end(), rej.begin(), rej.end());
+                try { X.tc.submit_chunk_v3(x.data(), na + nr, n_embd, p0, bits); } catch (const std::exception & e) { err = e.what(); return false; }
+                std::vector<ggml_fp16_t> t;
+                return X.tc.finish_v3(l, t, hh, err);
+            };
+            std::vector<float> l1, l2, l3; std::vector<ggml_fp16_t> h1, h2, h3;
+            if (!verify(P, a, r, ALL, l1, h1) || !verify(P + a, a2, r2, ALL | spt::CB_REWIND, l2, h2) ||
+                !X.chunk(P + a + a2, nf, 0, ALL | spt::CB_REWIND, l3, h3, err)) return false;
+            lg.assign(l2.begin(), l2.begin() + (size_t) a2 * NV); lg.insert(lg.end(), l3.begin(), l3.end());
+            h.assign(h2.begin(), h2.begin() + (size_t) a2 * n_embd); h.insert(h.end(), h3.begin(), h3.end());
+            return true;
+        };
+        std::vector<float> lgX, lgX2, lgZ; std::vector<ggml_fp16_t> hX, hX2, hZ;
+        if (!run_x(1, lgX, hX))   { check(false, tag + " X: " + err); continue; }
+        if (!run_x(2, lgX2, hX2)) { check(false, tag + " X2: " + err); continue; }
+        auto same = [](const void * x, const void * y, size_t n) { return memcmp(x, y, n) == 0; };
+        auto max_diff = [](const float * x, const float * y, size_t n) { double m = 0; for (size_t i = 0; i < n; i++) m = std::max(m, (double) std::fabs(x[i] - y[i])); return m; };
+        char b[200];
 
-        const bool same_lg = lgX.size() == lgY.size() && memcmp(lgX.data(), lgY.data(), lgX.size() * sizeof(float)) == 0;
-        const bool same_h  = hX.size() == hY.size() && memcmp(hX.data(), hY.data(), hX.size() * 2) == 0;
-        double md = 0;
-        for (size_t i = 0; i < std::min(lgX.size(), lgY.size()); i++) md = std::max(md, (double) std::fabs(lgX[i] - lgY[i]));
-        // the accepted rows themselves were computed in a (k+1)-row batch in X and an a-row batch in Y
-        double mda = 0;
-        for (size_t i = 0; i < (size_t) a * NV && i < lgYa.size(); i++) mda = std::max(mda, (double) std::fabs(lgV[i] - lgYa[i]));
-        // Y computes the kept rows in an a-row batch, X in a (k+1)-row batch. When the backend picks a different matmul path for
-        // a rows (CPU: a == 1 takes mul_mv; Metal with n_embd 256: also a == 2), Y's own rows already differ from X's before any
-        // rewind (mda > 0), so that reference can't be bit-compared. Bit-exactness is required whenever mda == 0; otherwise the
-        // post-rewind rows may differ by no more than fp noise: 1e-3, or a quarter of the kept rows' own pre-rewind difference
-        // when that is larger (Metal with REGFED off: the reference's 1-3-row batches start 0.04-0.06 off, the rows after the
-        // rewind inherit 2-7% of that)
-        const bool noise_ok = mda > 0 && md <= std::max(1e-3, std::min(0.25 * mda, 0.05));
-        if (noise_ok && !(same_lg && same_h)) {
-            printf("PASS  r=%d (keep %d of %d): post-rewind logits within fp noise (max %.3g) of a reference whose %d-row batch takes "
-                   "another matmul path (its kept rows already differ by %.3g, before any rewind)\n", r, a, k + 1, md, a, mda);
-            fflush(stdout);
+        const bool xx = lgX.size() == lgX2.size() && hX.size() == hX2.size() &&
+                        same(lgX.data(), lgX2.data(), lgX.size() * sizeof(float)) && same(hX.data(), hX2.data(), hX.size() * 2);
+        snprintf(b, sizeof b, ": X vs X2 (other rejected rows) max |diff| %.3g", max_diff(lgX.data(), lgX2.data(), std::min(lgX.size(), lgX2.size())));
+        check(xx, tag + (xx ? ": X vs X2 (other rejected rows) bit-identical" : std::string(b)));
+
+        // Z is a reference only if its last prompt ubatch is eager
+        const int zl = (P + a + a2 - 1) % ub + 1;
+        if (zl <= replay) {
+            check(!exact, tag + ": no Z: its last prompt ubatch (" + std::to_string(zl) + " rows) would be lazy (<= replay " +
+                  std::to_string(replay) + "); pick --prompt so (P + kept) % ub > replay");
             continue;
         }
-        check(same_lg && same_h, "r=" + std::to_string(r) + " (keep " + std::to_string(a) + " of " + std::to_string(k + 1) +
-              "): post-rewind logits " + (same_lg ? "bit-identical" : "differ (max " + std::to_string(md) + ")") +
-              ", h rows " + (same_h ? "bit-identical" : "differ") +
-              "; accepted rows in the verify batch vs Y max |diff| " + std::to_string(mda));
+        {
+            sess Z;
+            if (!Z.open(port, q, err) || !Z.prompt(P + a + a2, ub, err) || !Z.chunk(P + a + a2, nf, 0, ALL, lgZ, hZ, err)) {
+                check(false, tag + " Z: " + err); continue;
+            }
+        }
+        const float * fx = lgX.data() + (size_t) a2 * NV;
+        const ggml_fp16_t * hx = hX.data() + (size_t) a2 * n_embd;
+        const double mz = max_diff(fx, lgZ.data(), (size_t) nf * NV);
+        if (exact) {
+            const bool xz = same(fx, lgZ.data(), (size_t) nf * NV * sizeof(float)) && same(hx, hZ.data(), (size_t) nf * n_embd * 2);
+            snprintf(b, sizeof b, ": X vs Z (no replay) max |diff| %.3g", mz);
+            check(xz, tag + (xz ? ": X vs Z (no replay) bit-identical" : std::string(b)));
+        } else {
+            printf("INFO  %s: X vs Z (no replay) max |diff| %.3g (bit-compared with --exact)\n", tag.c_str(), mz);
+            fflush(stdout);
+        }
     }
 
     // a rewind deeper than the last chunk (into the prompt's last ubatch, which was > replay tokens) must be refused

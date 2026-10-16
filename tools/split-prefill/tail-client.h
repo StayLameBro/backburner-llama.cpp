@@ -127,6 +127,7 @@ public:
         taps = std::move(taps_);
         h = std::move(h_);
         logits_.clear(); taps_.clear(); h_.clear();
+        logits_kind_ = LG_NONE;
         return true;
     }
 
@@ -158,6 +159,8 @@ private:
     bool stop_ = true;
     std::string error_;
     std::vector<float> logits_;
+    enum { LG_NONE, LG_LAST, LG_ALL };
+    int logits_kind_ = LG_NONE;       // what logits_ holds since the last finish
     std::vector<ggml_fp16_t> taps_;
     std::vector<ggml_fp16_t> h_;
     std::thread writer_, reader_;
@@ -295,8 +298,14 @@ private:
                 if (n_h) recv_all(fd_, hr.data(), n_h);
                 if (it.taps && tp.size() != (size_t) n_taps_ * it.n_tok * n_embd_) { fail("tap rows missing in CHUNK reply"); return; }
                 if (it.all_logits && r.n_logits && r.n_logits % (uint32_t) it.n_tok != 0) { fail("ALL_LOGITS reply is not whole rows"); return; }
-                std::lock_guard<std::mutex> lk(mu_);
+                std::unique_lock<std::mutex> lk(mu_);
                 if (r.n_logits) {
+                    // one finish returns all-rows logits or the last row, never a mix
+                    const int kind = it.all_logits ? LG_ALL : LG_LAST;
+                    if (logits_kind_ != LG_NONE && logits_kind_ != kind) {
+                        lk.unlock(); fail("ALL_LOGITS and single-row logits chunks mixed before one finish"); return;
+                    }
+                    logits_kind_ = kind;
                     if (it.all_logits) logits_.insert(logits_.end(), lg.begin(), lg.end());
                     else logits_ = std::move(lg);
                 }
