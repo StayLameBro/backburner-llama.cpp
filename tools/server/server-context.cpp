@@ -4070,11 +4070,16 @@ private:
 
             GGML_ASSERT(n_draft > 0);
 
+            // batch index of each verified row: accepted token i was sampled from the logits at spec_i_batch[i], which stay
+            // valid until the next decode on ctx_tgt (the draft runs on ctx_dft), so the token probabilities below can read them
+            std::vector<int32_t> i_batch_verify;
+
             // verify and try to accept the draft
             {
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                i_batch_verify = slot.spec_i_batch;
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
                 const bool spec_sample = synth_probs.empty() && common_speculative_sample_enabled() &&
                                          slot.task->params.sampling.temp > 0.0f;
@@ -4173,7 +4178,12 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                // pre-sampling probabilities from the verify batch's logits for this row (the same distribution the
+                // non-speculative path reports). Post-sampling probabilities would need the sampler's candidates per row,
+                // which common_sampler_sample_and_accept_n doesn't keep: those are still left unset for draft tokens
+                if (slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs && i < i_batch_verify.size()) {
+                    populate_token_probs(slot, result, false, params_base.special, i_batch_verify[i]);
+                }
 
                 slot.stats.n_gen += 1;
 

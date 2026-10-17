@@ -365,6 +365,7 @@ extern "C" {
         uint32_t n_rs_seq;              // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
         uint32_t n_rs_replay;           // infernet: GDN replay rollback capacity R (0 = off): one committed state + a log of up to R
                                         //   tokens replayed at the next decode; llama_n_rs_seq() then reports R - 1 [EXPERIMENTAL]
+                                        //   0 lets LLAMA_GDN_REPLAY set R; UINT32_MAX = off, env ignored
         uint32_t n_outputs_max;         // max outputs in a ubatch (0 = n_batch)
         uint32_t n_outputs_max_per_seq; // max outputs per sequence (0 = n_outputs_max)
         int32_t  n_threads;             // number of threads to use for generation

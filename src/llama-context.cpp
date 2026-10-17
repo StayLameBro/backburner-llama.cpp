@@ -114,10 +114,13 @@ llama_context::llama_context(
         cparams.n_rs_seq = 0;
     }
 
-    // infernet: GDN replay rollback (docs/replay-rollback.md). LLAMA_GDN_REPLAY=R overrides the context param.
-    cparams.n_rs_replay = params.n_rs_replay;
-    if (const char * env = getenv("LLAMA_GDN_REPLAY")) {
-        cparams.n_rs_replay = (uint32_t) std::max(0, atoi(env));
+    // infernet: GDN replay rollback (docs/replay-rollback.md). LLAMA_GDN_REPLAY=R is used only when the param is 0;
+    // UINT32_MAX means off and ignores the env (the split tail, when the Mac runs without replay)
+    cparams.n_rs_replay = params.n_rs_replay == UINT32_MAX ? 0 : params.n_rs_replay;
+    if (params.n_rs_replay == 0) {
+        if (const char * env = getenv("LLAMA_GDN_REPLAY")) {
+            cparams.n_rs_replay = (uint32_t) std::max(0, atoi(env));
+        }
     }
     if (cparams.n_rs_replay > 0) {
         if (model.arch != LLM_ARCH_QWEN35 || params.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT) {

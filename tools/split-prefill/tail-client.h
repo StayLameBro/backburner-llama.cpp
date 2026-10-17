@@ -7,6 +7,8 @@
 //   2. submit_chunk(...) the residual entering layer L for each ubatch of the append (pipelined, returns at once)
 //   3. finish(...): waits for every ack; returns the last chunk's logits and the tap-layer rows
 //   4. state_range(D, D+N, 3): the phone's rows of the append + its recurrent state, for the Mac to overwrite in place
+// Protocol v3 (v3() true after connect): submit_chunk_v3 can ask for every row's logits, the h_nextn rows, and a rewind of the
+// mirror into the last chunk (speculative decoding across the split); finish_v3 returns them.
 // Every call throws std::runtime_error on a link or phone error; the caller falls back to Mac-only.
 #pragma once
 
@@ -69,6 +71,7 @@ public:
     }
 
     uint32_t n_valid() const { return n_valid_; }
+    bool v3() const { return hello.base.proto >= 3; }
 
     void trim(uint32_t n) {
         idle_check();
@@ -85,8 +88,16 @@ public:
     }
 
     void submit_chunk(const float * resid, int n_tok, int n_embd, llama_pos pos0, bool want_logits, bool want_taps) {
+        submit_chunk_v3(resid, n_tok, n_embd, pos0, (want_logits ? CB_LOGITS : 0u) | (want_taps ? CB_TAPS : 0u));
+    }
+
+    // bits: chunk_bits. The v3 bits (CB_ALL_LOGITS, CB_H_ROWS, CB_REWIND) need v3(); CB_REWIND needs pos0 <= n_valid()
+    void submit_chunk_v3(const float * resid, int n_tok, int n_embd, llama_pos pos0, uint32_t bits) {
         check();
-        chunk_req q = { pos0, (uint32_t) n_tok, resid_f32 ? DT_F32 : DT_F16, (want_logits ? 1u : 0u) | (want_taps ? 2u : 0u) };
+        if ((bits & (CB_ALL_LOGITS | CB_H_ROWS | CB_REWIND)) && !v3()) throw std::runtime_error("tail_client: v3 CHUNK bits on a v2 worker");
+        const bool want_logits = (bits & (CB_LOGITS | CB_ALL_LOGITS)) != 0;
+        const bool want_taps   = (bits & CB_TAPS) != 0;
+        chunk_req q = { pos0, (uint32_t) n_tok, resid_f32 ? DT_F32 : DT_F16, bits };
         const size_t n = (size_t) n_tok * n_embd;
         std::vector<uint8_t> msg(sizeof(q) + n * (resid_f32 ? 4 : 2));
         memcpy(msg.data(), &q, sizeof(q));
@@ -94,7 +105,7 @@ public:
         else ggml_fp32_to_fp16_row(resid, (ggml_fp16_t *) (msg.data() + sizeof(q)), (int64_t) n);
         {
             std::lock_guard<std::mutex> lk(mu_);
-            queue_.push_back({ std::move(msg), n_tok, want_logits, want_taps });
+            queue_.push_back({ std::move(msg), n_tok, want_logits, want_taps, (bits & CB_ALL_LOGITS) != 0, (bits & CB_H_ROWS) != 0 });
             n_submitted_++;
         }
         n_valid_ = (uint32_t) pos0 + n_tok;
@@ -102,12 +113,21 @@ public:
     }
 
     bool finish(std::vector<float> & last_logits, std::vector<ggml_fp16_t> & taps, std::string & err) {
+        std::vector<ggml_fp16_t> h;
+        return finish_v3(last_logits, taps, h, err);
+    }
+
+    // logits: the last logits-carrying v1/v2 chunk's row, or, for CB_ALL_LOGITS chunks, every row of each such chunk in
+    // submit order; h: the h_nextn rows of every CB_H_ROWS chunk in submit order (f16, n_embd per row)
+    bool finish_v3(std::vector<float> & logits, std::vector<ggml_fp16_t> & taps, std::vector<ggml_fp16_t> & h, std::string & err) {
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [&] { return !error_.empty() || n_acked_ == n_submitted_; });
         if (!error_.empty()) { err = error_; return false; }
-        last_logits = std::move(logits_);
+        logits = std::move(logits_);
         taps = std::move(taps_);
-        logits_.clear(); taps_.clear();
+        h = std::move(h_);
+        logits_.clear(); taps_.clear(); h_.clear();
+        logits_kind_ = LG_NONE;
         return true;
     }
 
@@ -126,7 +146,7 @@ public:
     }
 
 private:
-    struct item { std::vector<uint8_t> msg; int n_tok; bool logits, taps; };
+    struct item { std::vector<uint8_t> msg; int n_tok; bool logits, taps, all_logits = false, h = false; };
 
     int fd_ = -1;
     uint32_t n_valid_ = 0, n_taps_ = 0;
@@ -139,7 +159,10 @@ private:
     bool stop_ = true;
     std::string error_;
     std::vector<float> logits_;
+    enum { LG_NONE, LG_LAST, LG_ALL };
+    int logits_kind_ = LG_NONE;       // what logits_ holds since the last finish
     std::vector<ggml_fp16_t> taps_;
+    std::vector<ggml_fp16_t> h_;
     std::thread writer_, reader_;
 
     void close_link() {
@@ -263,15 +286,31 @@ private:
                 }
                 if (h.type != MSG_CHUNK_ACK || h.len < sizeof(chunk_rep)) { fail("bad CHUNK reply"); return; }
                 chunk_rep r; recv_all(fd_, &r, sizeof(r));
+                if ((size_t) r.n_logits * sizeof(float) > h.len - sizeof(r)) { fail("bad CHUNK reply size"); return; }
                 std::vector<float> lg(r.n_logits);
                 if (r.n_logits) recv_all(fd_, lg.data(), lg.size() * sizeof(float));
-                const size_t n_tap = h.len - sizeof(r) - (size_t) r.n_logits * sizeof(float);
-                std::vector<ggml_fp16_t> tp(n_tap / 2);
+                const size_t n_rest = h.len - sizeof(r) - (size_t) r.n_logits * sizeof(float);
+                const size_t n_h    = it.h ? (size_t) it.n_tok * n_embd_ * 2 : 0;
+                if (n_rest < n_h) { fail("h rows missing in CHUNK reply"); return; }
+                const size_t n_tap = n_rest - n_h;
+                std::vector<ggml_fp16_t> tp(n_tap / 2), hr(n_h / 2);
                 if (n_tap) recv_all(fd_, tp.data(), n_tap);
+                if (n_h) recv_all(fd_, hr.data(), n_h);
                 if (it.taps && tp.size() != (size_t) n_taps_ * it.n_tok * n_embd_) { fail("tap rows missing in CHUNK reply"); return; }
-                std::lock_guard<std::mutex> lk(mu_);
-                if (r.n_logits) logits_ = std::move(lg);
+                if (it.all_logits && r.n_logits && r.n_logits % (uint32_t) it.n_tok != 0) { fail("ALL_LOGITS reply is not whole rows"); return; }
+                std::unique_lock<std::mutex> lk(mu_);
+                if (r.n_logits) {
+                    // one finish returns all-rows logits or the last row, never a mix
+                    const int kind = it.all_logits ? LG_ALL : LG_LAST;
+                    if (logits_kind_ != LG_NONE && logits_kind_ != kind) {
+                        lk.unlock(); fail("ALL_LOGITS and single-row logits chunks mixed before one finish"); return;
+                    }
+                    logits_kind_ = kind;
+                    if (it.all_logits) logits_.insert(logits_.end(), lg.begin(), lg.end());
+                    else logits_ = std::move(lg);
+                }
                 taps_.insert(taps_.end(), tp.begin(), tp.end());
+                h_.insert(h_.end(), hr.begin(), hr.end());
                 tail_ms.push_back(r.compute_ms);
                 n_acked_++;
             } catch (const std::exception & e) { fail(std::string("recv ack: ") + e.what()); return; }

@@ -15,8 +15,13 @@
 //
 //   HELLO      hello_req            -> HELLO_OK hello_rep | ERR text
 //   RESET      -                    -> RESET_OK
-//   CHUNK      chunk_req + residual -> CHUNK_ACK chunk_rep + n_logits f32 | ERR text
+//   CHUNK      chunk_req + residual -> CHUNK_ACK chunk_rep + n_logits f32 [+ taps f16] [+ h rows f16] | ERR text
 //                residual = n_tok x n_embd, dtype 0 = f32, 1 = f16 (token-major)
+//                v3 want_logits bits (only after a HELLO_OK that reported proto >= 3):
+//                  4  ALL_LOGITS  logits for every row of the chunk (n_tok x n_vocab f32, row order), not just the last
+//                  8  H_ROWS      the h_nextn row (output_norm of the last layer) of every row, f16, after the taps
+//                  16 REWIND      pos0 may be below the mirror end: the mirror is first cut back to pos0 with the GDN
+//                                 replay rollback (llama_memory_seq_rm); ERR if that cut is deeper than the replay log
 //   STATE      -                    -> STATE_DATA blob (llama_state_seq_get_data, seq 0)
 //   BYE        -                    -> connection closed
 //
@@ -52,7 +57,9 @@
 namespace spt {
 
 constexpr uint32_t MAGIC         = 0x4C545053u; // "SPTL"
-constexpr uint32_t PROTO_VERSION = 2;   // v2 adds TRIM / SYNC / STATE_RANGE / taps; v1 clients (split-prefill) still work
+constexpr uint32_t PROTO_VERSION = 3;   // v2 adds TRIM / SYNC / STATE_RANGE / taps; v3 adds the CHUNK bits 4/8/16. v1/v2 clients still work
+constexpr uint32_t PROTO_HELLO   = 2;   // what clients put in HELLO: a v2 server refuses anything else, and a v3 server
+                                        // answers with proto 3 in HELLO_OK, which is how the client learns it may use v3 bits
 constexpr uint32_t STATE_FORMAT  = 1;           // llama_state_seq_* layout as parsed by split-prefill.cpp
 constexpr int      DEFAULT_PORT  = 50060;
 
@@ -81,7 +88,11 @@ struct hello_rep {
     uint64_t file_bytes;
     char     desc[128];
 };
-struct chunk_req { int32_t pos0; uint32_t n_tok, dtype, want_logits; };   // want_logits: bit 0 logits, bit 1 taps (v2)
+struct chunk_req { int32_t pos0; uint32_t n_tok, dtype, want_logits; };   // want_logits: bit 0 logits, bit 1 taps (v2), 4/8/16 (v3)
+enum chunk_bits : uint32_t { CB_LOGITS = 1, CB_TAPS = 2, CB_ALL_LOGITS = 4, CB_H_ROWS = 8, CB_REWIND = 16 };
+// CB_ALL_LOGITS returns n_tok x n_vocab f32 (~1 MB per row for a 248k vocab). It's for speculative verify batches (k+1 rows,
+// k+1 < n_rs_replay), so both sides refuse a bigger chunk instead of letting a phone with little headroom allocate it
+inline uint32_t all_logits_max_rows(uint32_t n_rs_replay) { return n_rs_replay > 16 ? n_rs_replay : 16; }
 // v2 HELLO: hello_req + context settings the Mac server uses, so both caches have the same layout
 struct hello_req2 {
     hello_req base;
@@ -321,8 +332,10 @@ private:
     uint32_t ctx_n_ctx_ = 0, ctx_n_ub_ = 0;
     int32_t  ctx_type_k_ = -1, ctx_type_v_ = -1;
     uint32_t ctx_fa_ = 0, ctx_replay_ = 0;
+    std::string replay_mismatch_;   // set at HELLO when this tail's replay depth isn't the Mac's; the session is refused at HELLO (CB_REWIND / SYNC checks are a second line)
     uint64_t session_ = 0;
     uint32_t n_valid_ = 0;            // the mirror holds positions [0, n_valid_) of the Mac's conversation
+    bool     h_rows_on_ = false;      // v3: llama_set_embeddings_nextn is on (the last CHUNK asked for h rows)
     std::vector<int32_t> taps_;
     uint32_t layer_start_ = 0, n_layer_full_ = 0;
     accept_filter_fn accept_ok_;
@@ -355,7 +368,7 @@ private:
                 memcpy(&q2, in_.data(), h.len);
                 const hello_req & q = q2.base;
                 std::string err = load();
-                if (err.empty() && ((q.proto != PROTO_VERSION && q.proto != 1) || q.state_format != STATE_FORMAT)) {
+                if (err.empty() && (q.proto < 1 || q.proto > PROTO_VERSION || q.state_format != STATE_FORMAT)) {
                     err = "version mismatch: client proto " + std::to_string(q.proto) + "/state " + std::to_string(q.state_format) +
                           ", phone proto " + std::to_string(PROTO_VERSION) + "/state " + std::to_string(STATE_FORMAT) +
                           " - rebuild both from the same llama.cpp tree";
@@ -375,13 +388,34 @@ private:
                     cp.n_ctx = q.n_ctx; cp.n_batch = q.n_ubatch; cp.n_ubatch = q.n_ubatch;
                     cp.n_seq_max = 1; cp.no_perf = true;
                     cp.type_k = (ggml_type) q2.type_k; cp.type_v = (ggml_type) q2.type_v;
-                    cp.n_rs_replay = q2.n_rs_replay;
+                    // the depth comes from the Mac. A Mac at 0 sends 0, mapped to UINT32_MAX (off): LLAMA_GDN_REPLAY in this
+                    // process can't turn it on, so both sides stay at 0
+                    cp.n_rs_replay = q2.n_rs_replay ? q2.n_rs_replay : UINT32_MAX;
+                    const char * e = getenv("LLAMA_GDN_REPLAY");
+                    if (e && (uint32_t) atoi(e) != q2.n_rs_replay) {
+                        log_(std::string("LLAMA_GDN_REPLAY=") + e + " ignored: the tail takes the replay depth from the Mac's HELLO");
+                    }
                     if (q2.flash_attn) cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
                     ctx_ = llama_init_from_model(model_, cp);
+                    h_rows_on_ = false;
                     if (!ctx_) err = "tail context creation failed (n_ctx " + std::to_string(q.n_ctx) + ", out of memory?)";
                     else { ctx_n_ctx_ = q.n_ctx; ctx_n_ub_ = q.n_ubatch; ctx_type_k_ = q2.type_k; ctx_type_v_ = q2.type_v;
                            ctx_fa_ = q2.flash_attn; ctx_replay_ = q2.n_rs_replay; }
+                    // the replay depth must be the Mac's: a rewind and split prefill's recurrent-state push (its row layout
+                    // depends on the depth) need it. Backstop: a depth that differs anyway is refused below (the CB_REWIND /
+                    // SYNC checks stay as a second line). Checked for a Mac at 0 too
+                    replay_mismatch_.clear();
+                    if (ctx_) {
+                        const uint32_t eff = llama_n_rs_seq(ctx_) > 0 ? llama_n_rs_seq(ctx_) + 1 : 0;
+                        if (eff != q2.n_rs_replay) {
+                            replay_mismatch_ = "replay depth mismatch: the Mac uses n_rs_replay " + std::to_string(q2.n_rs_replay) +
+                                               ", this tail got " + std::to_string(eff) + " (unexpected: the tail takes the depth from HELLO)";
+                        }
+                    }
                 }
+                // backstop: a mismatch here means the context changed the depth by itself. Refuse at connect rather than at
+                // the first SYNC or rewind
+                if (err.empty() && !replay_mismatch_.empty()) err = replay_mismatch_;
                 if (!err.empty()) { status("error", err); send_err(fd, err); return; }
                 // the mirror survives a reconnect only for the same session with the same settings
                 if (!(v2 && q2.keep && same_ctx && q2.session == session_)) {
@@ -434,6 +468,11 @@ private:
                 if (q.n_tok == 0 || q.n_tok > ctx_n_ub_ || h.len != sizeof(q) + (size_t) q.n_tok * n_embd * el) {
                     send_err(fd, "bad CHUNK payload"); return;
                 }
+                if ((q.want_logits & CB_ALL_LOGITS) && q.n_tok > all_logits_max_rows(ctx_replay_)) {
+                    send_err(fd, "CHUNK asks for all-row logits on " + std::to_string(q.n_tok) + " rows, at most " +
+                                 std::to_string(all_logits_max_rows(ctx_replay_)));
+                    return;
+                }
                 status("busy");
                 const auto t0 = std::chrono::steady_clock::now();
                 const float * resid = nullptr;
@@ -448,19 +487,41 @@ private:
                     resid = f32_.data();
                 }
                 std::string err;
+                if (q.pos0 < 0) { send_err(fd, "CHUNK pos0 " + std::to_string(q.pos0) + " < 0"); return; }
+                if ((q.want_logits & CB_REWIND) && !replay_mismatch_.empty()) {
+                    status("error", replay_mismatch_); send_err(fd, replay_mismatch_); return;
+                }
+                if ((q.want_logits & CB_REWIND) && (uint32_t) q.pos0 < n_valid_) {
+                    // v3: cut the mirror back to pos0 (attention KV rows >= pos0, and the GDN replay log). Works only within the
+                    // replay window the HELLO's n_rs_replay set up, and only for the last chunk's tokens: the Mac checks the same
+                    // limits before it asks, so a refusal here means the two sides disagree. The ERR closes the link and the
+                    // request in flight fails; the next request reconnects and prefills from 0
+                    if (!llama_memory_seq_rm(llama_get_memory(ctx_), 0, q.pos0, -1)) {
+                        const std::string e = "CHUNK rewind to " + std::to_string(q.pos0) + " from " + std::to_string(n_valid_) +
+                                              " is outside the replay window (n_rs_replay " + std::to_string(ctx_replay_) + ")";
+                        status("error", e); send_err(fd, e); return;
+                    }
+                    n_valid_ = (uint32_t) q.pos0;
+                }
                 if ((uint32_t) q.pos0 != n_valid_) {
                     // v1 clients prefill from 0 after RESET; v2 clients chunk right after the mirror
                     if (q.pos0 != 0 || n_valid_ != 0) { send_err(fd, "CHUNK pos0 " + std::to_string(q.pos0) + " != mirror end " + std::to_string(n_valid_)); return; }
                 }
+                const bool want_h = (q.want_logits & CB_H_ROWS) != 0;
+                if (want_h != h_rows_on_) {
+                    llama_set_embeddings_nextn(ctx_, want_h, /*masked*/ false);   // unmasked: a row for every token of the chunk
+                    h_rows_on_ = want_h;
+                }
                 // a head-less tail (split-gguf.py --no-head) has no logits to give: the chunk is acked without them
-                const float * lg = run_chunk(resid, (int) q.n_tok, n_embd, q.pos0, (q.want_logits & 1) != 0 && !no_head_, err);
+                const int lg_mode = no_head_ ? 0 : (q.want_logits & CB_ALL_LOGITS) ? 2 : (q.want_logits & CB_LOGITS) ? 1 : 0;
+                const float * lg = run_chunk(resid, (int) q.n_tok, n_embd, q.pos0, lg_mode, err);
                 if (!err.empty()) { status("error", err); send_err(fd, err); return; }
                 n_valid_ = (uint32_t) q.pos0 + q.n_tok;
                 const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
                 chunk_rep r = {};
                 r.status = 0; r.n_tok = q.n_tok; r.compute_ms = (float) ms;
-                r.n_logits = lg ? (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_)) : 0;
+                r.n_logits = lg ? (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_)) * (lg_mode == 2 ? q.n_tok : 1u) : 0;
                 std::vector<ggml_fp16_t> tap16;
                 if ((q.want_logits & 2) && !taps_.empty()) {
                     const size_t per = (size_t) q.n_tok * n_embd;
@@ -470,6 +531,15 @@ private:
                         if (!rows) { send_err(fd, "tap layer " + std::to_string(taps_[t]) + " not captured"); return; }
                         ggml_fp32_to_fp16_row(rows, tap16.data() + t * per, (int64_t) per);
                     }
+                }
+                if (want_h) {
+                    // f16 like the taps: h only feeds the draft head, never the verify, so f16 can't change an emitted token
+                    const size_t per = (size_t) q.n_tok * n_embd;
+                    const float * h = llama_get_embeddings_nextn(ctx_);
+                    if (!h) { send_err(fd, "h_nextn rows not captured"); return; }
+                    const size_t off = tap16.size();
+                    tap16.resize(off + per);
+                    ggml_fp32_to_fp16_row(h, tap16.data() + off, (int64_t) per);
                 }
                 if (lg) {
                     std::vector<uint8_t> tail_payload((size_t) r.n_logits * sizeof(float) + tap16.size() * 2);
@@ -510,6 +580,9 @@ private:
                 const double work_ms = ms_since(t_in);
                 if (!ctx_ || h.len < sizeof(sync_req)) { send_err(fd, "bad SYNC"); return; }
                 sync_req q; memcpy(&q, in_.data(), sizeof(q));
+                if (!replay_mismatch_.empty()) {   // before the KV rows too: split prefill sends them first, then the state
+                    status("error", replay_mismatch_); send_err(fd, replay_mismatch_); return;
+                }
                 status("busy", "sync");
                 llama_state_filter_set(0, 0x7fffffff, 0, 0x7fffffff, /*kv append*/ 1, /*rs replace*/ 0, (q.flags & 1) != 0, (q.flags & 2) != 0);
                 const size_t n = llama_state_seq_set_data(ctx_, in_.data() + sizeof(q), h.len - sizeof(q), 0);
@@ -586,7 +659,8 @@ private:
     }
 
     // same batch construction as split-prefill.cpp local_tail
-    const float * run_chunk(const float * resid, int n_tok, int n_embd, llama_pos pos0, bool want_logits, std::string & err) {
+    // lg_mode: 0 no logits, 1 the last row's, 2 every row's (v3 ALL_LOGITS; llama_get_logits returns them in row order)
+    const float * run_chunk(const float * resid, int n_tok, int n_embd, llama_pos pos0, int lg_mode, std::string & err) {
         const int rope = llama_model_rope_type(model_);
         const int n_pos = (rope == LLAMA_ROPE_TYPE_MROPE || rope == LLAMA_ROPE_TYPE_IMROPE) ? 4 : 1;
         llama_batch b = llama_batch_init(n_tok, n_embd, 1);
@@ -594,15 +668,15 @@ private:
         b.pos = (llama_pos *) malloc(sizeof(llama_pos) * n_tok * n_pos);
         for (int j = 0; j < n_pos; ++j) for (int i = 0; i < n_tok; ++i) b.pos[j*n_tok + i] = pos0 + i;
         memcpy(b.embd, resid, sizeof(float) * (size_t) n_tok * n_embd);
-        for (int i = 0; i < n_tok; ++i) { b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = 0; }
-        b.logits[n_tok - 1] = want_logits;
+        for (int i = 0; i < n_tok; ++i) { b.n_seq_id[i] = 1; b.seq_id[i][0] = 0; b.logits[i] = lg_mode == 2; }
+        b.logits[n_tok - 1] = lg_mode != 0;
         b.n_tokens = n_tok;
         const int rc = llama_decode(ctx_, b);
         llama_batch_free(b);
         if (rc != 0) { err = "tail llama_decode failed: " + std::to_string(rc); return nullptr; }
         if (llama_ffn_offload_failed(ctx_)) { err = "tail FFN offload failed (see the phone log)"; return nullptr; }
-        if (!want_logits) { llama_synchronize(ctx_); return nullptr; }
-        return llama_get_logits_ith(ctx_, n_tok - 1);
+        if (lg_mode == 0) { llama_synchronize(ctx_); return nullptr; }
+        return lg_mode == 2 ? llama_get_logits(ctx_) : llama_get_logits_ith(ctx_, n_tok - 1);
     }
 };
 

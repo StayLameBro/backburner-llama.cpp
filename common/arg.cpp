@@ -4175,7 +4175,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-gdn-replay"}, "N",
         "GDN replay rollback on the target (qwen35, one sequence): keep one committed recurrent state plus a log of\n"
         "the last verify batch (max(N, rollback depth + 1) tokens) and replay the accepted tokens at the next verify,\n"
-        "instead of one state slot per draft token (0 = off, default). Env override for any tool: LLAMA_GDN_REPLAY=R",
+        "instead of one state slot per draft token (0 = off, default). LLAMA_GDN_REPLAY=R sets it when this is 0",
         [](common_params & params, int value) {
             params.speculative.gdn_replay = value;
         }
