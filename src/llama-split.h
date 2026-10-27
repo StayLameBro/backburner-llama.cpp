@@ -113,9 +113,15 @@ struct llama_split_state {
     uint64_t sd_n_resets = 0;
     double   ms_push = 0, ms_wait = 0, ms_merge = 0;
 
+    // the memory this state is registered under (llama_split_register). The destructor unregisters it, so a context
+    // whose constructor throws after split_init leaves no entry behind (backburner-llama.cpp#5)
+    const llama_memory_i * reg_mem = nullptr;
+
     ~llama_split_state();
 };
 
 // registry memory -> split state (for llama_split_mem_event)
 void llama_split_register(const llama_memory_i * mem, llama_split_state * st);
 void llama_split_unregister(const llama_memory_i * mem);
+// true once for the fault llama_split_test_fault armed (kind 1 or 2)
+bool llama_split_take_test_fault(int32_t kind);
