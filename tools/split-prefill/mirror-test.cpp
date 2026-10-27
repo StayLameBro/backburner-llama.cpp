@@ -154,7 +154,7 @@ int main(int argc, char ** argv) {
     tc.resid_f32 = resid_f32;
     if (remote) {
         spt::hello_req2 q = {};
-        q.base.proto = spt::PROTO_VERSION; q.base.state_format = spt::STATE_FORMAT;
+        q.base.proto = spt::PROTO_HELLO; q.base.state_format = spt::STATE_FORMAT;
         q.base.L = (uint32_t) L; q.base.n_layer_full = (uint32_t) n_layer; q.base.n_embd = (uint32_t) n_embd;
         q.base.n_vocab = (uint32_t) n_vocab; q.base.n_ctx = cp.n_ctx; q.base.n_ubatch = (uint32_t) ub;
         q.type_k = cp.type_k; q.type_v = cp.type_v;

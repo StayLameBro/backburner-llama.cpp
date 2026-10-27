@@ -60,14 +60,28 @@ void llama_split_mem_event(const llama_memory_i * mem, llama_split_event ev, lla
     }
     llama_split_state * st = it->second;
     if (st->sd) {
-        // split decode: the worker holds the only copy of layers >= L, which can't be rewound. Any edit below its end makes
-        // the next decode TRIM it to 0, and that decode must then start at position 0 (a full re-prefill)
+        // split decode: the worker holds the only copy of layers >= L. A v2 worker can't rewind it: any edit below its end makes
+        // the next decode TRIM it to 0, and that decode must then start at position 0 (a full re-prefill). A v3 worker follows a
+        // seq_rm into the last decode call when the GDN replay log still holds it (this context's own seq_rm just succeeded, and
+        // the worker decoded the same chunks with the same n_rs_replay): the next chunk rewinds it (CB_REWIND)
         const llama_pos W_new = ev == LLAMA_SPLIT_EV_RM ? (seq <= 0 ? std::min(st->W, std::max<llama_pos>(0, p0)) : st->W) : 0;
+        if (W_new < st->W && ev == LLAMA_SPLIT_EV_RM && st->sd_v3 && st->tc) {
+            const int depth = (int) (st->W - W_new);
+            // the same bound llama_memory_recurrent::seq_rm applies: a lazy ubatch (<= n_rs_replay tokens) stays in the log
+            if (depth <= st->sd_last_n && st->sd_last_n <= (int) st->sd_replay) {
+                st->W = W_new;
+                st->sd_rewind = true;
+                st->sd_last_n -= depth;   // a second seq_rm before the next decode may cut only what is left of that call
+                st->sd_n_rewinds++;
+                return;
+            }
+        }
         if (W_new < st->W) {
             static const char * names[] = { "seq_rm", "clear / seq_add / seq_div / state load", "recurrent state load" };
             LLAMA_LOG_WARN("%s: split decode: %s at position %d, the phone holds [0, %d): both sides reset, the next decode re-prefills from 0\n",
                            __func__, names[ev], ev == LLAMA_SPLIT_EV_RM ? std::max<llama_pos>(0, p0) : 0, st->W);
             st->W = W_new;
+            st->sd_rewind = false;
             st->sd_n_resets++;
         }
         return;
@@ -306,7 +320,7 @@ int llama_context::split_begin(uint32_t n_tokens_all, uint32_t n_outputs_all) {
             char desc[256];
             llama_model_desc(&model, desc, sizeof(desc));
             spt::hello_req2 q = {};
-            q.base.proto = spt::PROTO_VERSION; q.base.state_format = spt::STATE_FORMAT;
+            q.base.proto = spt::PROTO_HELLO; q.base.state_format = spt::STATE_FORMAT;
             q.base.n_layer_full = (uint32_t) n_layer; q.base.n_embd = (uint32_t) model.hparams.n_embd;
             q.base.n_vocab = (uint32_t) model.vocab.n_tokens(); q.base.n_ctx = cparams.n_ctx; q.base.n_ubatch = cparams.n_ubatch;
             q.type_k = split_type_k; q.type_v = split_type_v;
@@ -727,7 +741,7 @@ bool llama_context::split_sd_connect(std::string & err) {
         char desc[256];
         llama_model_desc(&model, desc, sizeof(desc));
         spt::hello_req2 q = {};
-        q.base.proto = spt::PROTO_VERSION; q.base.state_format = spt::STATE_FORMAT;
+        q.base.proto = spt::PROTO_HELLO; q.base.state_format = spt::STATE_FORMAT;
         q.base.L = (uint32_t) L;
         q.base.n_layer_full = (uint32_t) n_layer; q.base.n_embd = (uint32_t) model.hparams.n_embd;
         q.base.n_vocab = (uint32_t) model.vocab.n_tokens(); q.base.n_ctx = cparams.n_ctx; q.base.n_ubatch = cparams.n_ubatch;
@@ -762,10 +776,16 @@ bool llama_context::split_sd_connect(std::string & err) {
             throw std::runtime_error("worker kept a mirror of " + std::to_string(r.n_valid) + " tokens after a fresh HELLO");
         }
         st.L = (uint32_t) L; st.n_layer = (uint32_t) n_layer;
+        st.sd_v3 = r.base.proto >= 3;
+        st.sd_replay = cparams.n_rs_replay;
+        st.sd_last_n = 0;
+        st.sd_rewind = false;
         st.tc = std::move(tc);
         st.W = 0;
-        LLAMA_LOG_WARN("%s: split decode: worker %s:%d = %s, layers [%u, %d) + head there, n_ctx %u, HELLO %.0f ms\n", __func__,
-                       st.host.c_str(), st.port, r.base.desc, st.L, n_layer, r.base.n_ctx, ms_since(t0));
+        LLAMA_LOG_WARN("%s: split decode: worker %s:%d = %s, layers [%u, %d) + head there, n_ctx %u, HELLO %.0f ms, protocol v%u%s\n", __func__,
+                       st.host.c_str(), st.port, r.base.desc, st.L, n_layer, r.base.n_ctx, ms_since(t0), r.base.proto,
+                       st.sd_v3 ? (st.sd_replay > 0 ? " (speculative decoding: multi-row logits, h rows, rewind)" : " (no rewind: n_rs_replay is 0)")
+                                : " (speculative decoding needs a v3 worker: rebuild the app)");
         return true;
     } catch (const std::exception & e) {
         err = e.what();
@@ -791,7 +811,10 @@ int llama_context::split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all)
         return -1;
     };
     if (!b.token || b.embd) return bad("token batches only");
-    if (cparams.embeddings || cparams.embeddings_nextn) return bad("embeddings are not returned by the worker");
+    if (cparams.embeddings) return bad("embeddings are not returned by the worker");
+    if (cparams.embeddings_nextn && (!st.sd_v3 || cparams.embeddings_nextn_masked)) {
+        return bad(st.sd_v3 ? "masked embeddings_nextn: the worker returns a row for every token" : "embeddings_nextn needs a v3 worker (rebuild the app)");
+    }
     if (!sampling.samplers.empty()) return bad("backend samplers need the logits on this device");
     for (int il = (int) st.L + 1; il < (int) cparams.embeddings_layer_inp.size(); il++) {
         if (cparams.embeddings_layer_inp[il]) return bad("tap layer " + std::to_string(il) + " is on the worker");
@@ -801,8 +824,15 @@ int llama_context::split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all)
             return bad("one sequence (seq 0) with consecutive positions only");
         }
     }
+    if (!st.sd_v3 && (n_outputs_all > 1 || (n_outputs_all == 1 && !b.logits[n - 1]))) {
+        return bad(std::to_string(n_outputs_all) + " outputs requested: only the batch's last token can have logits (v3 worker: any)");
+    }
     if (n_outputs_all > 1 || (n_outputs_all == 1 && !b.logits[n - 1])) {
-        return bad(std::to_string(n_outputs_all) + " outputs requested: only the batch's last token can have logits");
+        if ((uint32_t) n > spt::all_logits_max_rows(cparams.n_rs_replay)) {
+            // a v3 worker returns every row's logits for such a batch (~1 MB per row) and refuses more rows than this
+            return bad(std::to_string(n_outputs_all) + " outputs in a " + std::to_string(n) + "-token batch: with outputs other than the "
+                       "last token, a batch may have at most " + std::to_string(spt::all_logits_max_rows(cparams.n_rs_replay)) + " tokens");
+        }
     }
     const llama_pos D = b.pos[0];
     if (D != memory->seq_pos_max(0) + 1) {
@@ -821,11 +851,17 @@ int llama_context::split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all)
     }
     try {
         auto & tc = *st.tc;
-        if (tc.n_valid() > (uint32_t) st.W) {
+        if (st.sd_rewind && tc.n_valid() > (uint32_t) st.W) {
+            // v3: the first chunk of this call cuts the worker's mirror back to W (CB_REWIND) instead of a reset
+        } else if (tc.n_valid() > (uint32_t) st.W) {
+            st.sd_rewind = false;
             LLAMA_LOG_WARN("%s: split decode: resetting the worker's mirror (it holds [0, %u), this context kept [0, %d))\n", __func__, tc.n_valid(), st.W);
             tc.trim((uint32_t) st.W);   // below the end: the worker resets to 0
+            st.W = (llama_pos) tc.n_valid();
+        } else {
+            st.sd_rewind = false;
+            st.W = (llama_pos) tc.n_valid();
         }
-        st.W = (llama_pos) tc.n_valid();
     } catch (const std::exception & e) {
         split_sd_fail(std::string("trim: ") + e.what());
         return -3;
@@ -835,6 +871,8 @@ int llama_context::split_sd_begin(uint32_t n_tokens_all, uint32_t n_outputs_all)
         return -3;
     }
     st.sd_D = D; st.sd_n = n;
+    st.sd_chunks.clear();
+    st.sd_multi = st.sd_v3 && (n_outputs_all > 1 || (n_outputs_all == 1 && !b.logits[n - 1]));
     st.sd_t0_us = ggml_time_us();
     return 0;
 #else
@@ -850,7 +888,30 @@ bool llama_context::split_sd_submit(int tok_off, int n_tok, llama_pos pos0, bool
     try {
         synchronize();
         const int n_embd = (int) model.hparams.n_embd;
-        st.tc->submit_chunk(embd_layer_inp[st.L].data + (size_t) tok_off * n_embd, n_tok, n_embd, pos0, want_logits, false);
+        const float * resid = embd_layer_inp[st.L].data + (size_t) tok_off * n_embd;
+        if (!st.sd_v3) {
+            st.tc->submit_chunk(resid, n_tok, n_embd, pos0, want_logits, false);
+        } else {
+            // v3: outputs anywhere in the chunk -> every row's logits (the flagged ones are picked in split_sd_finish); only
+            // the last row -> the v2 single row. h rows for the MTP draft head; the rewind rides on the call's first chunk
+            const llama_batch & b = balloc->get_batch();
+            int n_out = 0;
+            for (int i = 0; i < n_tok; i++) n_out += b.logits[tok_off + i] != 0;
+            uint32_t bits = 0;
+            if (st.sd_multi && n_out > 0) {
+                bits |= spt::CB_ALL_LOGITS;
+                st.sd_chunks.push_back({ tok_off, n_tok });
+            } else if (want_logits) {
+                bits |= spt::CB_LOGITS;
+            }
+            if (cparams.embeddings_nextn) bits |= spt::CB_H_ROWS;
+            if (st.sd_rewind) {
+                bits |= spt::CB_REWIND;
+                st.sd_rewind = false;
+            }
+            st.tc->submit_chunk_v3(resid, n_tok, n_embd, pos0, bits);
+        }
+        st.sd_last_n = n_tok;
         split_warm(st, true);
         return true;
     } catch (const std::exception & e) {
@@ -871,15 +932,40 @@ bool llama_context::split_sd_finish(uint32_t n_outputs_all) {
     try {
         const int64_t t_sub = ggml_time_us();
         std::vector<float> lg;
-        std::vector<ggml_fp16_t> taps;
+        std::vector<ggml_fp16_t> taps, hr;
         std::string err;
-        const bool ok = st.tc->finish(lg, taps, err);
+        const bool ok = st.tc->finish_v3(lg, taps, hr, err);
         split_warm(st, false);
         if (!ok) {
             throw std::runtime_error(err);
         }
-        if (n_outputs_all == 1) {
-            const size_t n_vocab = (size_t) model.vocab.n_tokens();
+        const size_t n_vocab = (size_t) model.vocab.n_tokens();
+        if (!st.sd_chunks.empty()) {
+            // v3 multi-row: lg holds every row of the sd_chunks chunks in order; copy the flagged ones in batch order, which is
+            // the order of this context's output rows (one sequence, consecutive positions: split_simple keeps the order)
+            const llama_batch & b = balloc->get_batch();
+            size_t n_rows = 0;
+            for (const auto & c : st.sd_chunks) n_rows += (size_t) c.second;
+            if (lg.size() != n_rows * n_vocab) {
+                throw std::runtime_error("worker returned " + std::to_string(lg.size() / std::max<size_t>(n_vocab, 1)) + " logits rows, want " +
+                                         std::to_string(n_rows));
+            }
+            if (!logits.data || logits.size < (size_t) n_outputs_all * n_vocab) {
+                throw std::runtime_error("no logits buffer for the outputs");
+            }
+            size_t row = 0, out = 0;
+            for (const auto & c : st.sd_chunks) {
+                for (int i = 0; i < c.second; i++, row++) {
+                    if (b.logits[c.first + i]) {
+                        memcpy(logits.data + out * n_vocab, lg.data() + row * n_vocab, n_vocab * sizeof(float));
+                        out++;
+                    }
+                }
+            }
+            if (out != (size_t) n_outputs_all) {
+                throw std::runtime_error("split decode: " + std::to_string(out) + " output rows from the worker, want " + std::to_string(n_outputs_all));
+            }
+        } else if (n_outputs_all == 1) {
             if (lg.size() != n_vocab) {
                 throw std::runtime_error("worker returned " + std::to_string(lg.size()) + " logits, want " + std::to_string(n_vocab) +
                                          " (a head-less tail?)");
@@ -888,6 +974,17 @@ bool llama_context::split_sd_finish(uint32_t n_outputs_all) {
                 throw std::runtime_error("no logits buffer for the output");
             }
             memcpy(logits.data, lg.data(), n_vocab * sizeof(float));
+        }
+        if (cparams.embeddings_nextn && st.sd_v3) {
+            // unmasked h_nextn: one row per token of the batch, where a local decode would have put it
+            const size_t n_embd = (size_t) model.hparams.n_embd;
+            if (hr.size() != (size_t) st.sd_n * n_embd) {
+                throw std::runtime_error("worker returned " + std::to_string(hr.size() / n_embd) + " h rows, want " + std::to_string(st.sd_n));
+            }
+            if (!embd_nextn.data || embd_nextn.size < hr.size()) {
+                throw std::runtime_error("no embeddings_nextn buffer for the h rows");
+            }
+            ggml_fp16_to_fp32_row(hr.data(), embd_nextn.data, (int64_t) hr.size());
         }
         st.W = st.sd_D + st.sd_n;
         st.n_calls++;
